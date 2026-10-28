@@ -3,7 +3,7 @@
 
 #define AppName "GitDesk"
 #ifndef AppVersion
-  #define AppVersion "1.0.2"
+  #define AppVersion "1.0.3"
 #endif
 
 [Setup]
@@ -23,6 +23,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequiredOverridesAllowed=dialog
 WizardStyle=modern
+CloseApplications=yes
+RestartApplications=no
 MinVersion=10.0
 
 [Languages]
@@ -50,6 +52,8 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\GitDesk\command"
 
 [Run]
 Filename: "{app}\GitDesk.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+; after an in-app (silent) update, reopen GitDesk automatically
+Filename: "{app}\GitDesk.exe"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 [Code]
 function GitInstalled(): Boolean;
