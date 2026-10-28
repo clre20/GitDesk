@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFrame, QHBoxLayout
 
 from . import icons, theme
 from .diffview import DiffView
+from .fastlist import FastList
 from .git import FileStatus, Status
 from .i18n import T
 
@@ -24,19 +25,15 @@ STATUS_COLOR = {"M": "#ca5010", "A": "#107c10", "D": "#c42b1c", "R": "#0078d4", 
                 "T": "#8764b8", "?": "#107c10", "U": "#c42b1c"}
 
 
-class FileList(QListWidget):
+class FileList(FastList):
+    """File list backed by a model: fast even with tens of thousands of files."""
+
     def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setUniformItemSizes(True)
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.setAlternatingRowColors(False)
+        super().__init__(parent, multi=True, key=lambda f: f.path if f is not None else None)
 
     def set_files(self, files, side):
-        keep = {it.data(Qt.UserRole).path for it in self.selectedItems()}
-        cur = self.currentItem().data(Qt.UserRole).path if self.currentItem() else None
-        self.blockSignals(True)
-        self.clear()
+        rows = []
+        muted = theme.C["text"]
         for f in files:
             code = f.x if side == "staged" else f.y
             if f.kind == "?":
@@ -44,28 +41,47 @@ class FileList(QListWidget):
             if f.kind == "u":
                 code = "U"
             letter, desc = STATUS_TEXT.get(code, (code, code))
-            name = os.path.basename(f.path) or f.path
-            d = os.path.dirname(f.path)
+            slash = f.path.rstrip("/").rfind("/")
+            name = f.path[slash + 1:] if slash >= 0 else f.path
+            d = f.path[:slash] if slash >= 0 else ""
             label = f"{letter}   {name}" + (f"    {d}" if d else "")
             if f.kind == "2" and f.orig:
                 label += f"   ← {f.orig}"
-            it = QListWidgetItem(label)
-            it.setData(Qt.UserRole, f)
-            it.setToolTip(f"{desc}: {f.path}")
-            it.setForeground(QBrush(QColor(STATUS_COLOR.get(code, theme.C["text"]))))
-            self.addItem(it)
-        if cur:
-            for i in range(self.count()):
-                if self.item(i).data(Qt.UserRole).path == cur:
-                    self.setCurrentRow(i, QItemSelectionModel.NoUpdate)
-                    break
-        for i in range(self.count()):
-            if self.item(i).data(Qt.UserRole).path in keep:
-                self.item(i).setSelected(True)
-        self.blockSignals(False)
+            rows.append((label, STATUS_COLOR.get(code, muted), f, f"{desc}: {f.path}"))
+        self.set_rows(rows)
 
     def selected_files(self):
-        return [it.data(Qt.UserRole) for it in self.selectedItems()]
+        return self.selected_data()
+
+
+JUNK_DIRS = ("__pycache__", "node_modules", ".venv", "venv", ".tox", ".pytest_cache", ".mypy_cache",
+             "dist", "build", "target", ".gradle", ".idea", ".vscode", ".next", ".cache",
+             ".DS_Store", "Thumbs.db", "htmlcov")
+JUNK_EXT = (".pyc", ".pyo", ".log", ".tmp", ".class", ".o", ".obj")
+
+
+def junk_patterns(paths):
+    """Find typical generated/dependency folders among untracked paths -> {pattern: count}."""
+    found = {}
+    for p in paths:
+        parts = p.split("/")
+        hit = None
+        for part in parts[:-1]:
+            if part in JUNK_DIRS:
+                hit = part + "/"
+                break
+        if hit is None:
+            base = parts[-1]
+            if base in JUNK_DIRS:
+                hit = base
+            else:
+                for ext in JUNK_EXT:
+                    if base.endswith(ext):
+                        hit = "*" + ext
+                        break
+        if hit:
+            found[hit] = found.get(hit, 0) + 1
+    return dict(sorted(found.items(), key=lambda kv: -kv[1]))
 
 
 class Section(QWidget):
@@ -111,6 +127,27 @@ class ChangesPanel(QWidget):
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
         lv.setSpacing(6)
+        # hint shown when there are many untracked files (usually generated / dependencies)
+        self.hint = QFrame()
+        self.hint.setObjectName("banner")
+        hl = QVBoxLayout(self.hint)
+        hl.setContentsMargins(10, 8, 10, 8)
+        self.hint_label = QLabel()
+        self.hint_label.setWordWrap(True)
+        hl.addWidget(self.hint_label)
+        hb = QHBoxLayout()
+        hb.addStretch(1)
+        self.hint_btn = QPushButton(T("加入 .gitignore", "Add to .gitignore"))
+        self.hint_btn.setProperty("accent", True)
+        self.hint_btn.clicked.connect(self._ignore_junk)
+        hide = QPushButton(T("不再提示", "Don't show again"))
+        hide.clicked.connect(self._hide_hint)
+        hb.addWidget(hide)
+        hb.addWidget(self.hint_btn)
+        hl.addLayout(hb)
+        self.hint.hide()
+        self._junk = {}
+        lv.addWidget(self.hint)
         vs = QSplitter(Qt.Vertical)
         self.sec_conf = Section(T("衝突 Conflicts", "Conflicts"), [
             ("resolve", T("全部標記已解決", "Mark all resolved"), "check")])
@@ -175,8 +212,8 @@ class ChangesPanel(QWidget):
 
         # wiring
         for sec, side in ((self.sec_un, "unstaged"), (self.sec_st, "staged"), (self.sec_conf, "conflict")):
-            sec.list.itemSelectionChanged.connect(lambda s=side: self._sel_changed(s))
-            sec.list.itemDoubleClicked.connect(lambda it, s=side: self._dbl(s, it))
+            sec.list.selectionChangedSimple.connect(lambda s=side: self._sel_changed(s))
+            sec.list.activatedRow.connect(lambda f, s=side: self._dbl(s, f))
             sec.list.customContextMenuRequested.connect(lambda pos, s=side, l=sec.list: self._menu(s, l, pos))
         self.sec_un.buttons["stage"].clicked.connect(self.stage_all)
         self.sec_un.buttons["discard"].clicked.connect(self.discard_all)
@@ -213,7 +250,38 @@ class ChangesPanel(QWidget):
         elif not (st.unstaged or st.staged or st.conflicts):
             self.diff.set_message(T("工作區是乾淨的，沒有變更。", "Working tree clean — nothing to commit."))
         self._update_commit_enabled()
+        self._update_hint(st)
         self._prefetch()
+
+    def _update_hint(self, st):
+        from PySide6.QtCore import QSettings
+        untracked = [f.path for f in st.unstaged if f.kind == "?"]
+        key = "hint/hide/" + self.rw.repo.path.replace("\\", "/").replace("/", "|")
+        if len(untracked) < 300 or QSettings().value(key, "") == "1":
+            self.hint.hide()
+            return
+        self._junk = junk_patterns(untracked)
+        if not self._junk:
+            self.hint.hide()
+            return
+        top = "、".join(f"{k} ({v:,})" for k, v in list(self._junk.items())[:5])
+        n = sum(self._junk.values())
+        self.hint_label.setText(T(
+            f"有 {len(untracked):,} 個未追蹤檔案，其中 {n:,} 個看起來是自動產生或套件檔案：{top}。"
+            f"這些通常不需要提交，加入 .gitignore 後清單會清爽很多，操作也會更快。",
+            f"{len(untracked):,} untracked files; {n:,} look generated or dependencies: {top}. "
+            f"These usually shouldn't be committed — ignoring them makes the list cleaner and faster."))
+        self.hint.show()
+
+    def _ignore_junk(self):
+        if self._junk:
+            self._ignore(list(self._junk.keys()))
+            self.hint.hide()
+
+    def _hide_hint(self):
+        from PySide6.QtCore import QSettings
+        QSettings().setValue("hint/hide/" + self.rw.repo.path.replace("\\", "/").replace("/", "|"), "1")
+        self.hint.hide()
 
     def _update_commit_enabled(self):
         ok = bool(self.summary.text().strip())
@@ -243,11 +311,8 @@ class ChangesPanel(QWidget):
             return
         for other in (self.sec_un.list, self.sec_st.list, self.sec_conf.list):
             if other is not lst:
-                other.blockSignals(True)
-                other.clearSelection()
-                other.blockSignals(False)
-        cur = lst.currentItem()
-        f = cur.data(Qt.UserRole) if cur and cur.isSelected() else files[0]
+                other.clear_selection_quiet()
+        f = lst.current_data() if lst.current_is_selected() else files[0]
         self._current = (side, f)
         self.show_current_diff()
 
@@ -282,7 +347,8 @@ class ChangesPanel(QWidget):
                     "readonly", f.path + T("（衝突）", " (conflict)"))
         if f.kind == "?" and os.path.isdir(os.path.join(repo.path, f.path)):
             return ("msg", f.path)
-        return ("diff", repo.diff_worktree(f.path, untracked=f.kind == "?", opts=opts), "unstaged", f.path)
+        from .history import cap_diff
+        return ("diff", cap_diff(repo.diff_worktree(f.path, untracked=f.kind == "?", opts=opts)), "unstaged", f.path)
 
     def _display(self, res):
         if res[0] == "msg":
@@ -334,8 +400,9 @@ class ChangesPanel(QWidget):
                                   lambda res, key=key: cache.put(key, res),
                                   key=("pre",) + key, low=True)
 
-    def _dbl(self, side, it):
-        f = it.data(Qt.UserRole)
+    def _dbl(self, side, f):
+        if f is None:
+            return
         if side == "unstaged":
             self.stage([f])
         elif side == "staged":
@@ -347,16 +414,19 @@ class ChangesPanel(QWidget):
     # ------------------------------------------------------------------ operations
     def stage(self, files):
         if files:
-            self.rw.git_sync(["add", "-A", "--"] + [f.path for f in files])
+            self.rw.git_sync(["add", "-A", "--"] + [f.path for f in files],
+                             title=T(f"正在暫存 {len(files):,} 個檔案…", f"Staging {len(files):,} file(s)…"))
 
     def unstage(self, files):
         if not files:
             return
         paths = [f.path for f in files]
         if self._has_head():
-            self.rw.git_sync(["restore", "--staged", "--"] + paths)
+            self.rw.git_sync(["restore", "--staged", "--"] + paths,
+                             title=T(f"正在取消暫存 {len(paths):,} 個檔案…", f"Unstaging {len(paths):,} file(s)…"))
         else:
-            self.rw.git_sync(["rm", "--cached", "-r", "-q", "--"] + paths)
+            self.rw.git_sync(["rm", "--cached", "-r", "-q", "--"] + paths,
+                             title=T(f"正在取消暫存 {len(paths):,} 個檔案…", f"Unstaging {len(paths):,} file(s)…"))
 
     def discard(self, files):
         if not files:
@@ -369,19 +439,20 @@ class ChangesPanel(QWidget):
             return
         untracked = [f.path for f in files if f.kind == "?"]
         tracked = [f.path for f in files if f.kind != "?"]
+        title = T(f"正在捨棄 {len(files):,} 個檔案的變更…", f"Discarding changes in {len(files):,} file(s)…")
         if tracked:
-            self.rw.git_sync(["restore", "--"] + tracked)
+            self.rw.git_sync(["restore", "--"] + tracked, title=title)
         if untracked:
-            self.rw.git_sync(["clean", "-f", "-d", "--"] + untracked)
+            self.rw.git_sync(["clean", "-f", "-d", "--"] + untracked, title=title)
 
     def stage_all(self):
-        self.rw.git_sync(["add", "-A"])
+        self.rw.git_sync(["add", "-A"], title=T("正在暫存所有檔案…", "Staging all files…"))
 
     def unstage_all(self):
         if self._has_head():
-            self.rw.git_sync(["reset", "-q"])
+            self.rw.git_sync(["reset", "-q"], title=T("正在取消暫存所有檔案…", "Unstaging all files…"))
         else:
-            self.rw.git_sync(["rm", "--cached", "-r", "-q", "."])
+            self.rw.git_sync(["rm", "--cached", "-r", "-q", "."], title=T("正在取消暫存所有檔案…", "Unstaging all files…"))
 
     def discard_all(self):
         if not self.rw.confirm(T("全部捨棄", "Discard all"),
@@ -390,9 +461,9 @@ class ChangesPanel(QWidget):
                                danger=True):
             return
         if self.status and any(f.kind != "?" for f in self.status.unstaged):
-            self.rw.git_sync(["restore", "."])
+            self.rw.git_sync(["restore", "."], title=T("正在捨棄所有變更…", "Discarding all changes…"))
         if self.status and any(f.kind == "?" for f in self.status.unstaged):
-            self.rw.git_sync(["clean", "-f", "-d"])
+            self.rw.git_sync(["clean", "-f", "-d"], title=T("正在刪除未追蹤檔案…", "Deleting untracked files…"))
 
     def _apply_patch(self, patch, args, what):
         if what == "discard" and not self.rw.confirm(
@@ -505,6 +576,10 @@ class ChangesPanel(QWidget):
     def _ignore(self, patterns):
         p = os.path.join(self.rw.repo.path, ".gitignore")
         existing = open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+        have = {l.strip() for l in existing.splitlines()}
+        patterns = [x for x in patterns if x not in have]
+        if not patterns:
+            return
         with open(p, "a", encoding="utf-8") as fh:
             if existing and not existing.endswith("\n"):
                 fh.write("\n")

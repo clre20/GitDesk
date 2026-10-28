@@ -57,6 +57,76 @@ class Banner(QFrame):
         self.show()
 
 
+class BusyOverlay(QWidget):
+    """Semi-transparent "working…" layer: keeps the window responsive and shows progress
+    while long git operations run in the background."""
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("BusyOverlay { background: rgba(0,0,0,70); }")
+        lay = QVBoxLayout(self)
+        lay.setAlignment(Qt.AlignCenter)
+        card = QFrame()
+        card.setObjectName("card")
+        card.setMinimumWidth(360)
+        card.setMaximumWidth(480)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(24, 20, 24, 18)
+        cl.setSpacing(10)
+        row = QHBoxLayout()
+        self.spin = QLabel(self.FRAMES[0])
+        self.spin.setStyleSheet(f"font-size: 22pt; color: {theme.C['accent']};")
+        self.title = QLabel(T("處理中…", "Working…"))
+        self.title.setProperty("h2", True)
+        self.title.setWordWrap(True)
+        row.addWidget(self.spin)
+        row.addWidget(self.title, 1)
+        cl.addLayout(row)
+        self.detail = QLabel("")
+        self.detail.setProperty("muted", True)
+        self.detail.setWordWrap(True)
+        cl.addWidget(self.detail)
+        self.btn_cancel = QPushButton(T("取消", "Cancel"))
+        cl.addWidget(self.btn_cancel, 0, Qt.AlignRight)
+        lay.addWidget(card, 0, Qt.AlignCenter)
+        self._i = 0
+        self._anim = QTimer(self, interval=90)
+        self._anim.timeout.connect(self._tick)
+        self.hide()
+        parent.installEventFilter(self)
+
+    def _tick(self):
+        self._i = (self._i + 1) % len(self.FRAMES)
+        self.spin.setText(self.FRAMES[self._i])
+
+    def eventFilter(self, obj, e):
+        from PySide6.QtCore import QEvent
+        if obj is self.parent() and e.type() == QEvent.Resize:
+            self.setGeometry(self.parent().rect())
+        return False
+
+    def start(self, title, detail="", cancellable=True):
+        self.title.setText(title)
+        self.detail.setText(detail)
+        self.btn_cancel.setVisible(cancellable)
+        self.setGeometry(self.parent().rect())
+        self.raise_()
+        self.show()
+        self._anim.start()
+
+    def update_text(self, title=None, detail=None):
+        if title is not None:
+            self.title.setText(title)
+        if detail is not None:
+            self.detail.setText(detail)
+
+    def stop(self):
+        self._anim.stop()
+        self.hide()
+
+
 class RepoWidget(QWidget):
     titleChanged = Signal()
     busyChanged = Signal(bool, str)
@@ -105,14 +175,20 @@ class RepoWidget(QWidget):
         self.status_duration = 0.05
         self._first = True
 
+        self.overlay = BusyOverlay(self)
+        self.overlay.btn_cancel.clicked.connect(self.cancel_operations)
+        self._overlay_timer = QTimer(self, singleShot=True, interval=350)
+        self._overlay_timer.timeout.connect(self._show_overlay)
+        self._batch_total = 0
+        self._batch_done = 0
+        self._cancelled = False
+
         self.watcher = RepoWatcher(self.repo, self, worker=self.bg)
         self.watcher.changed.connect(self.refresh)
 
-        # first load is synchronous so the window opens fully populated
-        self._apply_refresh(self._load({"refs", "index", "state", "worktree", "config"}))
-        st = self.changes.status
-        has_changes = st and (st.unstaged or st.staged or st.conflicts)
-        self.show_view("changes" if has_changes or not st.oid or st.oid == "(initial)" else "history")
+        # first load runs in the background too, with a "loading" overlay for big repositories
+        self.overlay.start(T("正在讀取儲存庫…", "Loading repository…"), self.repo.path, cancellable=False)
+        self.refresh({"refs", "index", "state", "worktree", "config"})
 
     # ------------------------------------------------------------------ views
     def show_view(self, which):
@@ -177,6 +253,11 @@ class RepoWidget(QWidget):
                 self.titleChanged.emit()
             if not self._first and ("config" in kinds or "state" in kinds):
                 self.watcher.rescan()
+            if self._first:
+                has_changes = st.unstaged or st.staged or st.conflicts
+                self.show_view("changes" if has_changes or not st.oid or st.oid == "(initial)" else "history")
+                if not self._busy:
+                    self.overlay.stop()
             self._first = False
             if self.main:
                 self.main.update_status_bar(self)
@@ -237,17 +318,29 @@ class RepoWidget(QWidget):
             program=None, quiet=False):
         """Run a git command asynchronously (queued), then refresh."""
         self._queue.append((list(args), title, on_done, env, show_output, refresh, program, quiet))
+        self._batch_total += 1
         if not self._busy:
+            self._cancelled = False
             self._next()
 
     def _next(self):
         if not self._queue:
             self._busy = False
+            self._batch_total = self._batch_done = 0
+            self._overlay_timer.stop()
+            if not self._first:
+                self.overlay.stop()
             self.busyChanged.emit(False, "")
             return
         args, title, on_done, env, show_output, refresh, program, quiet = self._queue.pop(0)
         self._busy = True
-        self.busyChanged.emit(True, title or ("git " + " ".join(args[:2])))
+        label = title or ("git " + " ".join(args[:2]))
+        self._cur_label = label
+        self.busyChanged.emit(True, label)
+        if self.overlay.isVisible():
+            self._update_overlay()
+        elif not self._overlay_timer.isActive():
+            self._overlay_timer.start()
         from .git import GitTask
         task = GitTask(args, self.repo.path, env=env, parent=self, program=program)
         self._tasks.append(task)
@@ -255,8 +348,19 @@ class RepoWidget(QWidget):
         def done(code, out, err, task=task):
             if task in self._tasks:
                 self._tasks.remove(task)
+            self._batch_done += 1
             text = (out + ("\n" if out and err else "") + err).strip()
+            if self._cancelled:
+                task.deleteLater()
+                self.refresh_all()
+                QTimer.singleShot(0, self._next)
+                return
             if code != 0 and not quiet:
+                # drop the rest of a split batch so one failure doesn't produce many dialogs
+                self._queue = [q for q in self._queue if q[1] != title]
+                self._batch_total = self._batch_done + len(self._queue)
+                self._overlay_timer.stop()
+                self.overlay.stop()
                 self._report_failure(args, text)
             elif show_output:
                 self.show_text(title or "git", text or T("（沒有輸出）", "(no output)"))
@@ -265,7 +369,7 @@ class RepoWidget(QWidget):
                     on_done(code, out, err)
                 except Exception as ex:  # keep the queue alive
                     LOG.entry.emit("err", repr(ex))
-            if refresh:
+            if refresh and not self._queue_has_refreshing():
                 self.refresh_all()
             task.deleteLater()
             QTimer.singleShot(0, self._next)
@@ -280,16 +384,57 @@ class RepoWidget(QWidget):
             return
         self.error("git " + " ".join(args[:3]), text or T("命令失敗", "Command failed"))
 
-    def git_sync(self, args, refresh=True, log=True):
-        """Quick synchronous git call with error reporting."""
-        try:
-            out = self.repo.git(*args, log=log)
-        except GitError as e:
-            self.error("git " + " ".join(args[:3]), str(e))
-            out = None
-        if refresh:
-            self.refresh({"index", "refs"} if args and args[0] in ("branch", "tag", "remote", "stash", "notes", "update-ref") else {"index"})
-        return out
+    def _queue_has_refreshing(self):
+        return any(q[5] for q in self._queue)    # a later queued command will refresh anyway
+
+    def _show_overlay(self):
+        if self._busy:
+            self.overlay.start(self._cur_label, "")
+            self._update_overlay()
+
+    def _update_overlay(self):
+        total = self._batch_total
+        detail = T(f"步驟 {self._batch_done + 1} / {total}", f"Step {self._batch_done + 1} of {total}") if total > 1 else ""
+        self.overlay.update_text(self._cur_label, detail)
+
+    def cancel_operations(self):
+        """Stop the running git command and drop everything still queued."""
+        self._cancelled = True
+        self._queue.clear()
+        for t in list(self._tasks):
+            t.kill()
+        LOG.entry.emit("info", T("已取消", "Cancelled"))
+
+    MAX_ARGS_CHARS = 7000    # Windows limits a command line to ~32k characters
+
+    def git_sync(self, args, refresh=True, log=True, on_done=None, title=None):
+        """Run a quick git command in the background (queued, in order).
+
+        Long path lists (e.g. thousands of files) are split into several commands so
+        they never exceed the OS command-line limit; a progress overlay appears if it
+        takes more than a moment."""
+        args = list(args)
+        label = title or T("執行 git ", "Running git ") + " ".join(a for a in args[:2] if not a.startswith("-"))
+        if "--" in args:
+            i = args.index("--")
+            head, paths = args[:i + 1], args[i + 1:]
+        else:
+            head, paths = args, []
+        if sum(len(p) + 3 for p in paths) <= self.MAX_ARGS_CHARS:
+            chunks = [paths]
+        else:
+            chunks, cur, size = [], [], 0
+            for p in paths:
+                if cur and size + len(p) + 3 > self.MAX_ARGS_CHARS:
+                    chunks.append(cur)
+                    cur, size = [], 0
+                cur.append(p)
+                size += len(p) + 3
+            if cur:
+                chunks.append(cur)
+        for n, chunk in enumerate(chunks):
+            last = n == len(chunks) - 1
+            self.run(head + chunk, label, on_done if last else None, refresh=last and refresh)
 
     def is_busy(self):
         return self._busy
