@@ -1,4 +1,4 @@
-; Inno Setup script — produces GitDesk-Setup-<version>.exe for Windows 10/11 (x64).
+; Inno Setup script - produces GitDesk-Setup-<version>.exe for Windows 10/11 (x64).
 ; Build: run packaging\windows\build_windows.ps1 (it calls ISCC with this file).
 
 #define AppName "GitDesk"
@@ -27,11 +27,10 @@ MinVersion=10.0
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "chinesetraditional"; MessagesFile: "compiler:Languages\ChineseTraditional.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "contextmenu"; Description: "Add ""Open with GitDesk"" to folder right-click menu / 加入資料夾右鍵選單"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "contextmenu"; Description: "Add ""Open with GitDesk"" to folder right-click menu"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 Source: "..\..\dist\GitDesk\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -62,7 +61,6 @@ end;
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and (not GitInstalled()) then
-    MsgBox('找不到 Git。請安裝 Git for Windows：https://git-scm.com/download/win' + #13#10 +
-           'Git was not found. Please install Git for Windows: https://git-scm.com/download/win',
+    MsgBox('Git was not found. Please install Git for Windows: https://git-scm.com/download/win',
            mbInformation, MB_OK);
 end;
