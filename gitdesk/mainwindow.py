@@ -48,9 +48,14 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self.dock)
         self.resizeDocks([self.dock], [140], Qt.Vertical)
 
+        from .updater import Updater
+        self.updater = Updater(self)
+        self.updater.stateChanged.connect(self._update_state)
         self._build_toolbar()
         self._build_menus()
         self._build_status()
+        if QSettings().value("update/auto", "true") != "false":
+            QTimer.singleShot(4000, lambda: self.updater.check(manual=False))
         st = QSettings().value("ui/geometry")
         if st:
             self.restoreGeometry(st)
@@ -254,6 +259,10 @@ class MainWindow(QMainWindow):
 
         # Help
         m = mb.addMenu(T("說明(&H)", "&Help"))
+        m.addAction(A(T("檢查更新…", "Check for updates…"), lambda: self.updater.check(manual=True),
+                      "refresh", repo=False))
+        m.addAction(A(T("開啟發布頁面", "Open releases page"), self._open_releases, "globe", repo=False))
+        m.addSeparator()
         m.addAction(A(T("關於", "About"), self.about, "info", repo=False))
 
     def _build_status(self):
@@ -268,7 +277,37 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.lbl_branch)
         sb.addWidget(self.lbl_sync)
         sb.addWidget(self.lbl_busy, 1)
+        self.btn_update = QToolButton()
+        self.btn_update.setAutoRaise(True)
+        self.btn_update.hide()
+        self.btn_update.clicked.connect(lambda: self.updater.prompt() if self.updater.state == "update"
+                                        else self.updater.check(manual=True))
+        sb.addPermanentWidget(self.btn_update)
         sb.addPermanentWidget(self.lbl_watch)
+
+    def _update_state(self, state, text):
+        """Status-bar badge: development build or update available."""
+        if state == "update":
+            self.btn_update.setText("⬆ " + text)
+            self.btn_update.setToolTip(T("點一下查看並安裝更新", "Click to see and install the update"))
+            self.btn_update.setStyleSheet(f"color:{theme.C['accent']}; font-weight:600;")
+            self.btn_update.show()
+        elif state == "dev":
+            self.btn_update.setText("⚙ " + text)
+            self.btn_update.setToolTip(T("目前版本比 GitHub 上最新發布版還新", "This version is newer than the latest GitHub release"))
+            self.btn_update.setStyleSheet("color:#ca5010; font-weight:600;")
+            self.btn_update.show()
+        else:
+            self.btn_update.hide()
+        rw = self.current_repo()
+        if rw:
+            self._update_tab(rw)
+
+    def _open_releases(self):
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        from .updater import RELEASES_PAGE
+        QDesktopServices.openUrl(QUrl(RELEASES_PAGE))
 
     def _tools(self):
         from . import tools
@@ -320,7 +359,8 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(i, f"{rw.title()}  ·  {b}")
         if rw is self.current_repo():
             self.update_status_bar(rw)
-            self.setWindowTitle(f"{rw.repo.path} — {APP_NAME}")
+            dev = T("（開發版）", " (development build)") if self.updater.state == "dev" else ""
+            self.setWindowTitle(f"{rw.repo.path} — {APP_NAME} {__version__}{dev}")
 
     def close_tab(self, i):
         w = self.tabs.widget(i)
@@ -464,6 +504,8 @@ class MainWindow(QMainWindow):
         f.text("branch", T("git init 預設分支", "Default branch for git init"), s.value("git/default_branch", "main"))
         name = run_git(["config", "--global", "--get", "user.name"], check=False).strip()
         email = run_git(["config", "--global", "--get", "user.email"], check=False).strip()
+        f.check("autoupdate", T("啟動時自動檢查更新", "Check for updates at startup"),
+                s.value("update/auto", "true") != "false")
         f.text("name", T("全域 user.name", "Global user.name"), name)
         f.text("email", T("全域 user.email", "Global user.email"), email)
         try:
@@ -484,6 +526,7 @@ class MainWindow(QMainWindow):
         reset_cache()
         s.setValue("git/pull_mode", v["pull"])
         s.setValue("git/default_branch", v["branch"] or "main")
+        s.setValue("update/auto", "true" if v["autoupdate"] else "false")
         try:
             if v["name"] and v["name"] != name:
                 run_git(["config", "--global", "user.name", v["name"]], log=True)
@@ -500,7 +543,10 @@ class MainWindow(QMainWindow):
             ver = run_git(["--version"], check=False).strip()
         except Exception:
             ver = "git ?"
-        QMessageBox.about(self, APP_NAME, f"<h3>{APP_NAME} {__version__}</h3>"
+        from .updater import install_kind, kind_label
+        dev = T("　開發版", "  development build") if self.updater.state == "dev" else ""
+        QMessageBox.about(self, APP_NAME, f"<h3>{APP_NAME} {__version__}{dev}</h3>"
+                          + f"<p>{kind_label(install_kind())}</p>"
                           + T("<p>跨平台（Windows / Linux）圖形化 Git 用戶端。</p>",
                               "<p>Cross-platform (Windows / Linux) graphical Git client.</p>")
                           + f"<p>{ver}</p>")
