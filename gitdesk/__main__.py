@@ -41,7 +41,12 @@ def main():
     app.setWindowIcon(icons.app_icon())
 
     from .mainwindow import MainWindow
-    from .startup import StartupDialog, add_recent, ensure_repo
+    from .startup import LanguageDialog, StartupDialog, add_recent, ensure_repo
+    from PySide6.QtCore import QSettings
+
+    # very first launch: ask for the language before anything else
+    if QSettings().value("ui/language", "") not in ("zh_TW", "en"):
+        LanguageDialog().exec()     # closing it keeps the default (English)
 
     # The working folder for this session must be chosen before the main window opens.
     path = None

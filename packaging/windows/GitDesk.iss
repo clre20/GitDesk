@@ -1,9 +1,9 @@
-; Inno Setup script - produces GitDesk-Setup-<version>.exe for Windows 10/11 (x64).
+﻿; Inno Setup script - produces GitDesk-Setup-<version>.exe for Windows 10/11 (x64).
 ; Build: run packaging\windows\build_windows.ps1 (it calls ISCC with this file).
 
 #define AppName "GitDesk"
 #ifndef AppVersion
-  #define AppVersion "1.0.3"
+  #define AppVersion "1.0.4"
 #endif
 
 [Setup]
@@ -27,12 +27,24 @@ CloseApplications=yes
 RestartApplications=no
 MinVersion=10.0
 
+; Ask for the installer language first (pre-selects Traditional Chinese on Chinese Windows)
+ShowLanguageDialog=yes
+LanguageDetectionMethod=uilanguage
+
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+; bundled so the build does not depend on the Inno Setup version installed
+Name: "chinesetraditional"; MessagesFile: "ChineseTraditional.isl"
+
+[CustomMessages]
+english.ContextMenu=Add "Open with GitDesk" to the folder right-click menu
+chinesetraditional.ContextMenu=在資料夾右鍵選單加入「Open with GitDesk」
+english.GitMissing=Git was not found. Please install Git for Windows: https://git-scm.com/download/win
+chinesetraditional.GitMissing=找不到 Git。請安裝 Git for Windows：https://git-scm.com/download/win
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "contextmenu"; Description: "Add ""Open with GitDesk"" to folder right-click menu"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "contextmenu"; Description: "{cm:ContextMenu}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 Source: "..\..\dist\GitDesk\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -50,6 +62,10 @@ Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\GitDesk"; ValueT
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\GitDesk"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\GitDesk.exe"""; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\Directory\Background\shell\GitDesk\command"; ValueType: string; ValueName: ""; ValueData: """{app}\GitDesk.exe"" ""%V"""; Tasks: contextmenu
 
+; Start GitDesk in the language chosen here (only if the user hasn't picked one in the app)
+Root: HKCU; Subkey: "Software\GitDesk\GitDesk\ui"; ValueType: string; ValueName: "language"; ValueData: "zh_TW"; Languages: chinesetraditional; Flags: createvalueifdoesntexist
+Root: HKCU; Subkey: "Software\GitDesk\GitDesk\ui"; ValueType: string; ValueName: "language"; ValueData: "en"; Languages: english; Flags: createvalueifdoesntexist
+
 [Run]
 Filename: "{app}\GitDesk.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 ; after an in-app (silent) update, reopen GitDesk automatically
@@ -65,6 +81,6 @@ end;
 procedure CurPageChanged(CurPageID: Integer);
 begin
   if (CurPageID = wpFinished) and (not GitInstalled()) then
-    MsgBox('Git was not found. Please install Git for Windows: https://git-scm.com/download/win',
+    MsgBox(CustomMessage('GitMissing'),
            mbInformation, MB_OK);
 end;
