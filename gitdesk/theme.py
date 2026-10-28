@@ -108,10 +108,33 @@ def _check_svg() -> str:
     return p.replace("\\", "/")
 
 
+def _svg_file(name: str, body: str, color: str) -> str:
+    import tempfile
+    d = os.path.join(tempfile.gettempdir(), "gitdesk-theme")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, f"{name}-{color.strip('#')}.svg")
+    if not os.path.exists(p):
+        with open(p, "w") as f:
+            f.write(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="{body}" fill="none" '
+                    f'stroke="{color}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>')
+    return p.replace("\\", "/")
+
+
 def stylesheet() -> str:
     c = C
     chk = _check_svg()
+    up = _svg_file("chev-up", "M4.5 10l3.5-3.5 3.5 3.5", c["muted"])
+    down = _svg_file("chev-down", "M4.5 6l3.5 3.5 3.5-3.5", c["muted"])
     return f"""
+    QSpinBox {{ padding-right: 20px; }}
+    QSpinBox::up-button, QSpinBox::down-button {{ subcontrol-origin: border; width: 18px;
+        border: none; background: transparent; }}
+    QSpinBox::up-button {{ subcontrol-position: top right; margin-top: 2px; }}
+    QSpinBox::down-button {{ subcontrol-position: bottom right; margin-bottom: 2px; }}
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {c['hover']}; border-radius: 3px; }}
+    QSpinBox::up-arrow {{ image: url("{up}"); width: 12px; height: 12px; }}
+    QSpinBox::down-arrow {{ image: url("{down}"); width: 12px; height: 12px; }}
+    QComboBox::down-arrow {{ image: url("{down}"); width: 12px; height: 12px; }}
     QCheckBox::indicator {{ width: 15px; height: 15px; border: 1px solid {c['muted']};
         border-radius: 4px; background: {c['base']}; }}
     QCheckBox::indicator:hover {{ border-color: {c['accent']}; }}

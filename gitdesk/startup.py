@@ -91,7 +91,8 @@ def ensure_repo(parent, path, ask=True):
             run_git(["add", "-A"], cwd=path, log=True)
             run_git(["commit", "--allow-empty", "-m", "Initial commit"], cwd=path, log=True)
     except Exception as e:
-        QMessageBox.critical(parent, "git init", str(e))
+        from .errors import show_git_error
+        show_git_error(parent, "git init", str(e))
         return None
     return Repo(path).path
 
@@ -212,7 +213,8 @@ class CloneDialog(QDialog):
             self.accept()
         else:
             self.ok.setEnabled(True)
-            QMessageBox.critical(self, "clone", err.strip()[-2000:] or T("複製失敗", "Clone failed"))
+            from .errors import show_git_error
+            show_git_error(self, T("複製失敗", "Clone failed"), err.strip()[-3000:])
 
     def _cancel(self):
         if self.task:
@@ -222,6 +224,7 @@ class CloneDialog(QDialog):
 
 class StartupDialog(QDialog):
     """Shown at launch: the user must pick the working folder for this session."""
+    _warned = False
 
     def __init__(self, parent=None, first_run=True):
         super().__init__(parent)
@@ -229,6 +232,8 @@ class StartupDialog(QDialog):
         self.setWindowIcon(icons.app_icon())
         self.resize(720, 560)
         self.path = None
+        self.first_run = first_run
+        self.relaunch = False
         v = QVBoxLayout(self)
         v.setContentsMargins(28, 24, 28, 20)
         v.setSpacing(14)
@@ -291,7 +296,8 @@ class StartupDialog(QDialog):
         bottom.addWidget(quit_btn)
         v.addLayout(bottom)
 
-        if not git_available():
+        if not git_available() and not StartupDialog._warned:
+            StartupDialog._warned = True
             QMessageBox.critical(self, APP_NAME, T(
                 "找不到 git。\n\nWindows：請安裝 Git for Windows（https://git-scm.com/download/win）。\n"
                 "Linux：請用套件管理員安裝，例如 sudo apt install git。\n\n安裝後也可以在「設定」中指定 git 路徑。",
@@ -301,7 +307,14 @@ class StartupDialog(QDialog):
 
     def _lang(self, lang):
         set_language(lang)
-        QMessageBox.information(self, APP_NAME, "語言將在重新啟動後套用。\nLanguage will apply after restart.")
+        if self.first_run:
+            # nothing else is on screen yet: switch immediately by rebuilding this dialog
+            from . import i18n
+            i18n._lang = lang
+            self.relaunch = True
+            self.done(2)
+        else:
+            QMessageBox.information(self, APP_NAME, "語言將在重新啟動後套用。\nLanguage will apply after restart.")
 
     def _fill_recent(self):
         self.recent.clear()
