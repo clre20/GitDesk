@@ -44,6 +44,20 @@ def reset_cache():
     _ENV = None
 
 
+def fmt_cmd(args, prefix="git") -> str:
+    """Command text for the log; long path lists are summarised so the log stays fast."""
+    if "--" in args:
+        i = args.index("--")
+        paths = args[i + 1:]
+        if len(paths) > 8:
+            shown = " ".join(shlex.quote(a) for a in args[:i + 1] + paths[:3])
+            return f"{prefix} {shown} … (+{len(paths) - 3} paths)"
+    text = " ".join(shlex.quote(a) for a in args)
+    if len(text) > 600:
+        text = text[:600] + " …"
+    return f"{prefix} {text}"
+
+
 def git_executable() -> str:
     global _GIT_EXE
     if _GIT_EXE is None:
@@ -146,7 +160,7 @@ def run_git(args: List[str], cwd: Optional[str] = None, input: Optional[str] = N
             binary: bool = False):
     full = [git_executable()] + BASE_CFG + list(args)
     if log:
-        LOG.entry.emit("cmd", "git " + " ".join(shlex.quote(a) for a in args))
+        LOG.entry.emit("cmd", fmt_cmd(list(args)))
     e = base_env()
     if env:
         e.update(env)
@@ -201,7 +215,7 @@ class GitTask(QObject):
             LOG.entry.emit("cmd", " ".join(shlex.quote(a) for a in [self.program] + self.args))
             self.proc.start(self.program, self.args)
         else:
-            LOG.entry.emit("cmd", "git " + " ".join(shlex.quote(a) for a in self.args))
+            LOG.entry.emit("cmd", fmt_cmd(self.args))
             self.proc.start(git_executable(), BASE_CFG + self.args)
 
     def kill(self):
@@ -228,6 +242,8 @@ class GitTask(QObject):
         out = "".join(self._out)
         err = "".join(self._err)
         text = (out + err).rstrip()
+        if len(text) > 20000:
+            text = text[:20000] + "\n…"
         if text:
             LOG.entry.emit("err" if code else "out", text)
         self.done.emit(code, out, err)

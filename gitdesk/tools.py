@@ -1136,8 +1136,7 @@ class CleanDialog(QDialog):
             return
         if not self.rw.confirm(T("清理", "Clean"), T(f"永久刪除 {len(paths)} 個項目？", f"Permanently delete {len(paths)} item(s)?"), danger=True):
             return
-        self.rw.git_sync(["clean", "-f", *self._flags(), "--"] + paths)
-        self.load()
+        self.rw.git_sync(["clean", "-f", *self._flags(), "--"] + paths, on_done=lambda *_: self.load())
 
 
 # =========================================================================== maintenance

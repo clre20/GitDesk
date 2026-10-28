@@ -15,6 +15,15 @@ from .graph import CommitModel, GraphDelegate, layout, parse_refs
 from .i18n import T
 
 PAGE = 2000
+MAX_DIFF_CHARS = 3_000_000
+
+
+def cap_diff(txt: str) -> str:
+    """Keep giant diffs from flooding memory / the UI (the viewer truncates further)."""
+    if len(txt) > MAX_DIFF_CHARS:
+        cut = txt.rfind("\n", 0, MAX_DIFF_CHARS)
+        return txt[:cut if cut > 0 else MAX_DIFF_CHARS] + "\n"
+    return txt
 
 
 class HistoryPanel(QWidget):
@@ -94,15 +103,16 @@ class HistoryPanel(QWidget):
         self.info = QTextBrowser()
         self.info.setOpenLinks(False)
         self.info.anchorClicked.connect(self._anchor)
-        self.files = QListWidget()
-        self.files.currentItemChanged.connect(self._file_changed)
+        from .fastlist import FastList
+        self.files = FastList(multi=False)
+        self.files.currentDataChanged.connect(lambda d: self._file_changed(d, None))
         self.files.setContextMenuPolicy(Qt.CustomContextMenu)
         self.files.customContextMenuRequested.connect(self._file_menu)
         left.addWidget(self.info)
         left.addWidget(self.files)
         left.setSizes([220, 200])
         self.diff = DiffView(self)
-        self.diff.optionsChanged.connect(lambda: self._file_changed(self.files.currentItem(), None))
+        self.diff.optionsChanged.connect(lambda: self._file_changed(self.files.current_data(), None))
         bottom.addWidget(left)
         bottom.addWidget(self.diff)
         bottom.setSizes([380, 800])
@@ -202,7 +212,7 @@ class HistoryPanel(QWidget):
             if not rows:
                 self.info.setHtml(f"<p style='color:{theme.C['muted']}'>" +
                                   T("還沒有任何提交。", "No commits yet.") + "</p>")
-                self.files.clear()
+                self.files.set_rows([], keep_selection=False)
                 self.diff.clear()
         if self._pending_jump:
             sha, tries = self._pending_jump
@@ -342,7 +352,7 @@ class HistoryPanel(QWidget):
                     path = files[0][1] if len(files) == 1 else None
                     k = ("cdiff", s2, path, None, opts)
                     if k not in cache:
-                        cache.put(k, self.rw.repo.diff_commit(s2, path, list(opts)))
+                        cache.put(k, cap_diff(self.rw.repo.diff_commit(s2, path, list(opts))))
                 return None
             self.rw.worker.submit(job, None, key=("pre-commit", s2), low=True)
 
@@ -360,26 +370,21 @@ class HistoryPanel(QWidget):
                               key="commit")
 
     def _fill_files(self, files, sha, parent):
-        self.files.blockSignals(True)
-        self.files.clear()
-        allit = QListWidgetItem(icons.icon("list"), T(f"全部檔案 ({len(files)})", f"All files ({len(files)})"))
-        allit.setData(Qt.UserRole, (sha, None, parent))
-        self.files.addItem(allit)
         from .changes import STATUS_COLOR
-        from PySide6.QtGui import QBrush, QColor
+        rows = [(T(f"全部檔案 ({len(files)})", f"All files ({len(files)})"), None, (sha, None, parent), "")]
+        text = theme.C["text"]
         for st, path, orig in files:
-            it = QListWidgetItem(f"{st}   {path}" + (f"   ← {orig}" if orig else ""))
-            it.setData(Qt.UserRole, (sha, path, parent))
-            it.setForeground(QBrush(QColor(STATUS_COLOR.get(st, theme.C["text"]))))
-            self.files.addItem(it)
-        self.files.blockSignals(False)
-        self.files.setCurrentRow(1 if len(files) == 1 else 0)
+            rows.append((f"{st}   {path}" + (f"   ← {orig}" if orig else ""), STATUS_COLOR.get(st, text),
+                         (sha, path, parent), path))
+        self.files.set_rows(rows, keep_selection=False, icons={0: icons.icon("list")})
+        # huge commits: start with the first file instead of one gigantic diff
+        self.files.select_row(1 if (len(files) == 1 or len(files) > 300) else 0)
         return True
 
-    def _file_changed(self, it, _prev):
-        if not it:
+    def _file_changed(self, data, _prev):
+        if not data:
             return
-        sha, path, parent = it.data(Qt.UserRole)
+        sha, path, parent = data
         opts = tuple(self.diff.diff_opts())
         key = ("cdiff", sha, path, parent, opts)
         title = path or sha[:10]
@@ -392,10 +397,9 @@ class HistoryPanel(QWidget):
 
         def done(txt, key=key):
             cache.put(key, txt)
-            cur = self.files.currentItem()
-            if cur and cur.data(Qt.UserRole) == (sha, path, parent):
+            if self.files.current_data() == (sha, path, parent):
                 self.diff.set_diff(txt, "readonly", title)
-        self.rw.worker.submit(lambda: self.rw.repo.diff_commit(sha, path, list(opts), parent=parent),
+        self.rw.worker.submit(lambda: cap_diff(self.rw.repo.diff_commit(sha, path, list(opts), parent=parent)),
                               done, key="cdiff")
 
     def _anchor(self, url: QUrl):
@@ -482,10 +486,10 @@ class HistoryPanel(QWidget):
         return m
 
     def _file_menu(self, pos):
-        it = self.files.itemAt(pos)
-        if not it:
+        d = self.files.data_at(pos)
+        if not d:
             return
-        sha, path, _parent = it.data(Qt.UserRole)
+        sha, path, _parent = d
         if not path:
             return
         from . import actions
