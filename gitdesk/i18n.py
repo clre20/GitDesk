@@ -1,10 +1,10 @@
 """Bilingual (Traditional Chinese / English) text helper.
 
 Usage:  T("提交", "Commit")
-The language is chosen once at startup from settings (or the system locale)
+The language is read once at startup from settings (default: English)
 and can be switched in Settings (takes effect after restart).
 """
-from PySide6.QtCore import QLocale, QSettings
+from PySide6.QtCore import QSettings
 
 _lang = None
 
@@ -15,8 +15,7 @@ def current_language() -> str:
         s = QSettings()
         v = s.value("ui/language", "")
         if v not in ("zh_TW", "en"):
-            name = QLocale.system().name()
-            v = "zh_TW" if name.startswith("zh") else "en"
+            v = "en"   # English by default; switch on the start screen or in Settings
         _lang = v
     return _lang
 

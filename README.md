@@ -27,9 +27,9 @@
 
 需要先安裝 Git · Requires Git: Windows → [Git for Windows](https://git-scm.com/download/win)；Linux → `sudo apt install git`
 
-- **Linux (Debian/Ubuntu)**：`sudo apt install ./gitdesk_1.0.0_amd64.deb`，之後從應用程式選單或執行 `gitdesk` 開啟。
-  其他發行版：解壓 `GitDesk-1.0.0-linux-x86_64.tar.gz`，執行 `GitDesk/gitdesk`。
-- **Windows 11**：執行 `GitDesk-Setup-1.0.0.exe`（可選加入資料夾右鍵「Open with GitDesk」）。
+- **Linux (Debian/Ubuntu)**：`sudo apt install ./gitdesk_1.0.1_amd64.deb`，之後從應用程式選單或執行 `gitdesk` 開啟。
+  其他發行版：解壓 `GitDesk-1.0.1-linux-x86_64.tar.gz`，執行 `GitDesk/gitdesk`。
+- **Windows 11**：執行 `GitDesk-Setup-1.0.1.exe`（可選加入資料夾右鍵「Open with GitDesk」）。
 
 ## 建置安裝檔 / Build installers
 

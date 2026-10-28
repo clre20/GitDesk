@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal
-from PySide6.QtGui import (QColor, QFont, QPainter, QTextBlockFormat, QTextCharFormat,
-                           QTextCursor, QTextFormat, QTextOption)
+from PySide6.QtGui import (QColor, QFont, QPainter, QSyntaxHighlighter, QTextBlockFormat,
+                           QTextCharFormat, QTextCursor, QTextFormat, QTextOption)
 from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel, QMenu, QPlainTextEdit,
                                QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget)
 
@@ -16,7 +16,7 @@ from .i18n import T
 from .theme import C
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
-MAX_LINES = 40000
+MAX_LINES = 30000
 
 
 @dataclass
@@ -151,6 +151,33 @@ class _Gutter(QWidget):
         self.view.paint_gutter(self, e)
 
 
+class _DiffHighlighter(QSyntaxHighlighter):
+    """Colors each line by its kind (added / removed / hunk / meta)."""
+
+    def __init__(self, view):
+        super().__init__(view.document())
+        self.view = view
+        self.formats = {}
+
+    def refresh_formats(self):
+        def f(color, bold=False):
+            x = QTextCharFormat()
+            x.setForeground(QColor(C[color]))
+            if bold:
+                x.setFontWeight(QFont.Bold)
+            return x
+        self.formats = {"add": f("add_fg"), "del": f("del_fg"), "hunk": f("hunk_fg"),
+                        "meta": f("muted"), "file": f("text", True)}
+
+    def highlightBlock(self, text):
+        n = self.currentBlock().blockNumber()
+        kinds = self.view.kinds
+        if n < len(kinds):
+            fmt = self.formats.get(kinds[n])
+            if fmt is not None:
+                self.setFormat(0, len(text), fmt)
+
+
 class DiffText(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,7 +188,9 @@ class DiffText(QPlainTextEdit):
         self.setFrameShape(QPlainTextEdit.NoFrame)
         self.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         self.numbers: List[tuple] = []
+        self.kinds: List[str] = []
         self.gutter = _Gutter(self)
+        self.highlighter = _DiffHighlighter(self)
         self.blockCountChanged.connect(self._update_margins)
         self.updateRequest.connect(self._update_gutter)
         self._update_margins()
@@ -182,6 +211,32 @@ class DiffText(QPlainTextEdit):
         super().resizeEvent(e)
         cr = self.contentsRect()
         self.gutter.setGeometry(QRect(cr.left(), cr.top(), self.gutter_width(), cr.height()))
+
+    BG = {"add": "add_bg", "del": "del_bg", "hunk": "hunk_bg", "file": "panel"}
+
+    def paintEvent(self, e):
+        # Full-width line backgrounds are painted here (only for visible lines),
+        # which is far faster than storing a block format on every line.
+        if self.kinds:
+            p = QPainter(self.viewport())
+            block = self.firstVisibleBlock()
+            n = block.blockNumber()
+            off = self.contentOffset()
+            w = self.viewport().width()
+            bottom_limit = e.rect().bottom()
+            colors = {k: QColor(C[v]) for k, v in self.BG.items()}
+            while block.isValid():
+                geo = self.blockBoundingGeometry(block).translated(off)
+                if geo.top() > bottom_limit:
+                    break
+                if n < len(self.kinds):
+                    col = colors.get(self.kinds[n])
+                    if col is not None:
+                        p.fillRect(QRect(0, int(geo.top()), w, int(geo.height()) + 1), col)
+                block = block.next()
+                n += 1
+            p.end()
+        super().paintEvent(e)
 
     def paint_gutter(self, w, e):
         p = QPainter(w)
@@ -271,6 +326,7 @@ class DiffView(QWidget):
         self.files = []
         self.map = []
         self.text.numbers = []
+        self.text.kinds = []
         self.text.clear()
         self.title.setText("")
         self._update_buttons()
@@ -287,83 +343,61 @@ class DiffView(QWidget):
         self.mode = mode
         self.title.setText(title)
         self.files = parse_diff(text)
-        self.map = []
-        numbers = []
-        doc = self.text.document()
-        doc.clear()
-        cur = QTextCursor(doc)
-        fmt_norm = QTextBlockFormat()
-        fmt_add = QTextBlockFormat(); fmt_add.setBackground(QColor(C["add_bg"]))
-        fmt_del = QTextBlockFormat(); fmt_del.setBackground(QColor(C["del_bg"]))
-        fmt_hunk = QTextBlockFormat(); fmt_hunk.setBackground(QColor(C["hunk_bg"]))
-        fmt_file = QTextBlockFormat(); fmt_file.setBackground(QColor(C["panel"]))
-        fmt_file.setTopMargin(6)
-        ch_norm = QTextCharFormat(); ch_norm.setForeground(QColor(C["text"]))
-        ch_add = QTextCharFormat(); ch_add.setForeground(QColor(C["add_fg"]))
-        ch_del = QTextCharFormat(); ch_del.setForeground(QColor(C["del_fg"]))
-        ch_hunk = QTextCharFormat(); ch_hunk.setForeground(QColor(C["hunk_fg"]))
-        ch_meta = QTextCharFormat(); ch_meta.setForeground(QColor(C["muted"]))
-        ch_file = QTextCharFormat(); ch_file.setFontWeight(QFont.Bold)
-        ch_file.setForeground(QColor(C["text"]))
-        first = True
-        count = 0
-        truncated = False
+        lines, kinds, numbers, mp = [], [], [], []
 
-        def add(txt, bf, cf, mp, nums):
-            nonlocal first, count
-            if not first:
-                cur.insertBlock(bf, cf)
-            else:
-                cur.setBlockFormat(bf)
-                cur.setBlockCharFormat(cf)
-                first = False
-            cur.insertText(txt, cf)
-            self.map.append(mp)
+        def add(txt, kind, m, nums):
+            lines.append(txt)
+            kinds.append(kind)
+            mp.append(m)
             numbers.append(nums)
-            count += 1
 
         multi = len(self.files) > 1
+        truncated = False
         if not self.files and text.strip():
-            for l in text.splitlines():
-                add(l, fmt_norm, ch_norm, None, (None, None))
+            for l in text.splitlines()[:MAX_LINES]:
+                add(l, "norm", None, (None, None))
         for fi, fd in enumerate(self.files):
-            if count > MAX_LINES:
+            if len(lines) > MAX_LINES:
                 truncated = True
                 break
             if multi:
-                add("▸ " + fd.path, fmt_file, ch_file, None, (None, None))
+                add("▸ " + fd.path, "file", None, (None, None))
             for hl in fd.header:
                 if hl.startswith(("diff --git", "index ", "--- ", "+++ ")):
                     continue
-                add(hl, fmt_norm, ch_meta, None, (None, None))
+                add(hl, "meta", None, (None, None))
             if fd.binary:
-                add(T("（二進位檔案）", "(binary file)"), fmt_norm, ch_meta, None, (None, None))
+                add(T("（二進位檔案）", "(binary file)"), "meta", None, (None, None))
             for hi, h in enumerate(fd.hunks):
-                add(h.header, fmt_hunk, ch_hunk, (fi, hi, None), (None, None))
+                add(h.header, "hunk", (fi, hi, None), (None, None))
                 o, n = h.old_start, h.new_start
                 for li, l in enumerate(h.lines):
                     tag = l[:1]
                     if tag == "+":
-                        add(l, fmt_add, ch_add, (fi, hi, li), (None, n)); n += 1
+                        add(l, "add", (fi, hi, li), (None, n)); n += 1
                     elif tag == "-":
-                        add(l, fmt_del, ch_del, (fi, hi, li), (o, None)); o += 1
+                        add(l, "del", (fi, hi, li), (o, None)); o += 1
                     elif tag == "\\":
-                        add(l, fmt_norm, ch_meta, (fi, hi, li), (None, None))
+                        add(l, "meta", (fi, hi, li), (None, None))
                     else:
-                        add(l, fmt_norm, ch_norm, (fi, hi, li), (o, n)); o += 1; n += 1
-                    if count > MAX_LINES:
-                        truncated = True
-                        break
-                if truncated:
+                        add(l, "norm", (fi, hi, li), (o, n)); o += 1; n += 1
+                if len(lines) > MAX_LINES:
+                    truncated = True
                     break
         if truncated:
-            add(T("… 差異過大，已截斷顯示", "… diff too large, truncated"), fmt_norm, ch_meta, None, (None, None))
-        if not self.files and not text.strip():
-            add(T("沒有差異", "No differences"), fmt_norm, ch_meta, None, (None, None))
-        self.text.numbers = numbers
-        self.text.gutter.update()
-        self.text.verticalScrollBar().setValue(vpos)
-        self.text.horizontalScrollBar().setValue(hpos)
+            add(T("… 差異過大，已截斷顯示", "… diff too large, truncated"), "meta", None, (None, None))
+        if not lines:
+            add(T("沒有差異", "No differences"), "meta", None, (None, None))
+        self.map = mp
+        t = self.text
+        t.kinds = kinds
+        t.numbers = numbers
+        if not t.highlighter.formats:
+            t.highlighter.refresh_formats()
+        t.setPlainText("\n".join(lines))
+        t.gutter.update()
+        t.verticalScrollBar().setValue(vpos)
+        t.horizontalScrollBar().setValue(hpos)
         self._update_buttons()
 
     # ------------------------------------------------------------------ actions

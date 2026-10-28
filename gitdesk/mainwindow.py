@@ -316,7 +316,7 @@ class MainWindow(QMainWindow):
     def _update_tab(self, rw):
         i = self.tabs.indexOf(rw)
         if i >= 0:
-            b = rw.repo.current_branch() or T("分離", "detached")
+            b = rw.current_branch() or T("分離", "detached")
             self.tabs.setTabText(i, f"{rw.title()}  ·  {b}")
         if rw is self.current_repo():
             self.update_status_bar(rw)
@@ -480,6 +480,8 @@ class MainWindow(QMainWindow):
         s.setValue("ui/theme", v["theme"])
         s.setValue("ui/diff_font_size", v["font"])
         s.setValue("git/path", v["git"] if v["git"] and v["git"] != "git" else "")
+        from .git import reset_cache
+        reset_cache()
         s.setValue("git/pull_mode", v["pull"])
         s.setValue("git/default_branch", v["branch"] or "main")
         try:
