@@ -48,9 +48,12 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if args and os.path.isdir(args[0]):
         path = ensure_repo(None, os.path.abspath(args[0]))
-    if not path:
+    while not path:
         d = StartupDialog()
-        if not d.exec() or not d.path:
+        ok = d.exec()
+        if d.relaunch:          # language switched on the start screen
+            continue
+        if not ok or not d.path:
             return 0
         path = d.path
 

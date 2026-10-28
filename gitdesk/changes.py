@@ -101,6 +101,7 @@ class ChangesPanel(QWidget):
         self.rw = rw
         self.status: Status = None
         self._current = None   # (side, FileStatus)
+        self._shown_key = None
         outer = QHBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         split = QSplitter(Qt.Horizontal)
@@ -167,7 +168,7 @@ class ChangesPanel(QWidget):
 
         self.diff = DiffView(self)
         self.diff.patchRequested.connect(self._apply_patch)
-        self.diff.optionsChanged.connect(self.show_current_diff)
+        self.diff.optionsChanged.connect(lambda: (self._prefetch(), self.show_current_diff()))
         split.addWidget(self.diff)
         split.setSizes([420, 800])
         split.setStretchFactor(1, 1)
@@ -207,10 +208,12 @@ class ChangesPanel(QWidget):
                 self.show_current_diff()
             else:
                 self._current = None
+                self._shown_key = None
                 self.diff.set_message(T("選擇一個檔案以檢視差異", "Select a file to see its diff"))
         elif not (st.unstaged or st.staged or st.conflicts):
             self.diff.set_message(T("工作區是乾淨的，沒有變更。", "Working tree clean — nothing to commit."))
         self._update_commit_enabled()
+        self._prefetch()
 
     def _update_commit_enabled(self):
         ok = bool(self.summary.text().strip())
@@ -221,12 +224,16 @@ class ChangesPanel(QWidget):
         self.counter.setText(T(f"{n} 個檔案已暫存", f"{n} file(s) staged"))
 
     def _amend_toggled(self, on):
-        if on and not self.summary.text().strip() and self.rw.repo.head_valid():
+        if on and not self.summary.text().strip() and self._has_head():
             msg = self.rw.repo.git("log", "-1", "--format=%B").rstrip()
             s, _, b = msg.partition("\n")
             self.summary.setText(s)
             self.body.setPlainText(b.strip())
         self._update_commit_enabled()
+
+    def _has_head(self):
+        st = self.status
+        return bool(st and st.oid and st.oid != "(initial)")
 
     # ------------------------------------------------------------------ selection
     def _sel_changed(self, side):
@@ -244,26 +251,88 @@ class ChangesPanel(QWidget):
         self._current = (side, f)
         self.show_current_diff()
 
-    def show_current_diff(self):
+    # ------------------------------------------------------------------ diffs (async + cached)
+    def _stamp(self, side, f):
+        """Cheap fingerprint of what a diff depends on (file + index timestamps)."""
+        def st(p):
+            try:
+                x = os.stat(p)
+                return (x.st_mtime_ns, x.st_size)
+            except OSError:
+                return None
+        idx = st(os.path.join(self.rw.repo.git_dir, "index"))
+        if side == "staged":
+            return (idx,)
+        return (idx, st(os.path.join(self.rw.repo.path, f.path)))
+
+    def _key(self, side, f, opts):
+        return ("wt", side, f.path, f.x, f.y, f.kind, f.submodule, tuple(opts), self._stamp(side, f))
+
+    def _compute(self, side, f, opts):
+        """Runs on the worker thread."""
+        repo = self.rw.repo
+        if f.submodule:
+            txt = repo.git("diff", "--submodule=log", *(["--cached"] if side == "staged" else []),
+                           "--", f.path, check=False)
+            return ("diff", txt, "readonly", f.path)
+        if side == "staged":
+            return ("diff", repo.diff_staged(f.path, opts), "staged", f.path)
+        if side == "conflict":
+            return ("diff", repo.git("diff", "--no-color", *opts, "--", f.path, check=False),
+                    "readonly", f.path + T("（衝突）", " (conflict)"))
+        if f.kind == "?" and os.path.isdir(os.path.join(repo.path, f.path)):
+            return ("msg", f.path)
+        return ("diff", repo.diff_worktree(f.path, untracked=f.kind == "?", opts=opts), "unstaged", f.path)
+
+    def _display(self, res):
+        if res[0] == "msg":
+            self.diff.set_message(res[1])
+        else:
+            self.diff.set_diff(res[1], res[2], res[3])
+
+    def show_current_diff(self, force=False):
         if not self._current:
             return
         side, f = self._current
-        repo = self.rw.repo
         opts = self.diff.diff_opts()
-        if f.submodule:
-            txt = repo.git("diff", "--submodule=log", *(["--cached"] if side == "staged" else []), "--", f.path, check=False)
-            self.diff.set_diff(txt, "readonly", f.path)
-        elif side == "staged":
-            self.diff.set_diff(repo.diff_staged(f.path, opts), "staged", f.path)
-        elif side == "conflict":
-            self.diff.set_diff(repo.git("diff", "--no-color", *opts, "--", f.path, check=False),
-                               "readonly", f.path + T("（衝突）", " (conflict)"))
-        else:
-            if f.kind == "?" and os.path.isdir(os.path.join(repo.path, f.path)):
-                self.diff.set_message(f.path)
-                return
-            self.diff.set_diff(repo.diff_worktree(f.path, untracked=f.kind == "?", opts=opts),
-                               "unstaged", f.path)
+        key = self._key(side, f, opts)
+        if key == self._shown_key and not force:
+            return                                  # nothing changed: keep scroll/selection
+        cache = self.rw.diff_cache
+        hit = cache.get(key)
+        if hit is not None:
+            self._shown_key = key
+            self._display(hit)
+            return
+        self.diff.title.setText(f.path + "  …")
+
+        def done(res, key=key, want=(side, f.path)):
+            cache.put(key, res)
+            if self._current and (self._current[0], self._current[1].path) == want:
+                self._shown_key = key
+                self._display(res)
+        self.rw.worker.submit(lambda: self._compute(side, f, opts), done, key="diff")
+
+    def status_touched(self):
+        """Status text unchanged but files may have been edited again: re-check the shown diff."""
+        self.show_current_diff()
+
+    def _prefetch(self):
+        """Pre-compute diffs of listed files in the background so clicks are instant."""
+        if not self.status:
+            return
+        opts = self.diff.diff_opts()
+        cache = self.rw.diff_cache
+        jobs = [("conflict", f) for f in self.status.conflicts[:20]] + \
+               [("unstaged", f) for f in self.status.unstaged[:60]] + \
+               [("staged", f) for f in self.status.staged[:60]]
+        for side, f in jobs:
+            key = self._key(side, f, opts)
+            if key in cache:
+                continue
+            self.rw.worker.submit(lambda side=side, f=f: self._compute(side, f, opts),
+                                  lambda res, key=key: cache.put(key, res),
+                                  key=("pre",) + key, low=True)
 
     def _dbl(self, side, it):
         f = it.data(Qt.UserRole)
@@ -284,7 +353,7 @@ class ChangesPanel(QWidget):
         if not files:
             return
         paths = [f.path for f in files]
-        if self.rw.repo.head_valid():
+        if self._has_head():
             self.rw.git_sync(["restore", "--staged", "--"] + paths)
         else:
             self.rw.git_sync(["rm", "--cached", "-r", "-q", "--"] + paths)
@@ -309,7 +378,7 @@ class ChangesPanel(QWidget):
         self.rw.git_sync(["add", "-A"])
 
     def unstage_all(self):
-        if self.rw.repo.head_valid():
+        if self._has_head():
             self.rw.git_sync(["reset", "-q"])
         else:
             self.rw.git_sync(["rm", "--cached", "-r", "-q", "."])

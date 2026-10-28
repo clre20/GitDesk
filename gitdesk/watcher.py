@@ -19,7 +19,9 @@ GIT_FILES_REFS = ["HEAD", "packed-refs", "FETCH_HEAD", "ORIG_HEAD", os.path.join
                   os.path.join("logs", "refs", "stash"), os.path.join("refs", "stash")]
 GIT_FILES_STATE = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "rebase-merge",
                    "rebase-apply", "sequencer", "AUTO_MERGE", "MERGE_MSG"]
-MAX_WATCHED_DIRS = 4000
+# Windows uses one OS handle per watched folder, so keep it small there;
+# a background `git status` poll covers everything that isn't watched.
+MAX_WATCHED_DIRS = 300 if os.name == "nt" else 2000
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache",
              ".pytest_cache", ".gradle", ".idea", "target", "dist", "build", ".next", ".cache"}
 
@@ -35,9 +37,12 @@ def _stat(p):
 class RepoWatcher(QObject):
     changed = Signal(set)   # {"refs", "index", "state", "worktree", "config"}
 
-    def __init__(self, repo: Repo, parent=None):
+    def __init__(self, repo: Repo, parent=None, worker=None):
         super().__init__(parent)
         self.repo = repo
+        self.worker = worker
+        self._stopped = False
+        self._watched = set()
         self._pending = set()
         self._paused = 0
         self.fs = QFileSystemWatcher(self)
@@ -58,10 +63,27 @@ class RepoWatcher(QObject):
         return {self.repo.git_dir, self.repo.common_dir}
 
     def _setup_watches(self):
+        """Collect folders to watch on the worker thread, then register them here."""
+        if self.worker:
+            self.worker.submit(self._collect_paths, self._apply_paths, key="watch-setup", low=True)
+        else:
+            self._apply_paths(self._collect_paths())
+
+    def _apply_paths(self, res):
+        if self._stopped or res is None:
+            return
+        paths, complete = res
         if self.fs.directories():
             self.fs.removePaths(self.fs.directories())
         if self.fs.files():
             self.fs.removePaths(self.fs.files())
+        self._wt_complete = complete
+        self._watched = set()
+        if paths:
+            failed = set(self.fs.addPaths(paths))
+            self._watched = {p for p in paths if p not in failed}
+
+    def _collect_paths(self):
         paths = []
         for g in self._git_dirs():
             paths.append(g)
@@ -74,7 +96,7 @@ class RepoWatcher(QObject):
         # working tree directories (skip ignored / heavy folders)
         ignored = self._ignored_dirs()
         count = 0
-        self._wt_complete = True
+        complete = True
         for root, dirs, _files in os.walk(self.repo.path):
             rel = os.path.relpath(root, self.repo.path)
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS and
@@ -82,11 +104,10 @@ class RepoWatcher(QObject):
             paths.append(root)
             count += 1
             if count >= MAX_WATCHED_DIRS:
-                self._wt_complete = False
+                complete = False
                 break
         paths = [p for p in dict.fromkeys(paths) if os.path.exists(p)]
-        if paths:
-            self.fs.addPaths(paths)
+        return paths, complete
 
     def _ignored_dirs(self):
         try:
@@ -121,21 +142,32 @@ class RepoWatcher(QObject):
         return kinds
 
     # ------------------------------------------------------------------ events
+    def _watch(self, p):
+        if p not in self._watched and len(self._watched) < MAX_WATCHED_DIRS + 200:
+            if self.fs.addPath(p):
+                self._watched.add(p)
+            return True
+        return p in self._watched
+
     def _on_dir(self, path):
         path = os.path.normpath(path)
-        in_git = any(path == g or path.startswith(g + os.sep) for g in self._git_dirs())
-        if in_git:
+        git_root = next((g for g in self._git_dirs() if path == g or path.startswith(g + os.sep)), None)
+        if git_root:
             self._pending |= self._compare_fp() or {"refs"}
-            # new ref folders (e.g. refs/heads/feature/) need watching
-            for root, _d, _f in os.walk(path):
-                if root not in self.fs.directories():
-                    self.fs.addPath(root)
+            # new ref folders (e.g. refs/heads/feature/) need watching — only under
+            # refs/ and logs/, never the object database
+            for sub in ("refs", "logs"):
+                base = os.path.join(git_root, sub)
+                if path == git_root or path.startswith(base):
+                    for root, _d, _f in os.walk(base if path == git_root else path):
+                        self._watch(root)
         else:
             self._pending.add("worktree")
             try:
                 for e in os.scandir(path):
-                    if e.is_dir() and e.name not in SKIP_DIRS and e.path not in self.fs.directories():
-                        self.fs.addPath(e.path)
+                    if e.is_dir(follow_symlinks=False) and e.name not in SKIP_DIRS \
+                            and not e.name.startswith(".") and not self._watch(e.path):
+                        self._wt_complete = False   # over budget: status poll covers it
             except OSError:
                 pass
         self._debounce.start()
@@ -151,8 +183,12 @@ class RepoWatcher(QObject):
         if self._paused:
             return
         kinds = self._compare_fp()
+        # Safety-net `git status` poll (runs on the worker thread). Its interval adapts
+        # to how long status takes, so huge repositories don't keep the CPU busy.
         self._status_poll_ticks += 1
-        if not self._wt_complete and self._status_poll_ticks % 3 == 0:
+        dur = getattr(self.parent(), "status_duration", 0.05) or 0.05
+        every = max(2 if not self._wt_complete else 4, min(40, int(dur * 8 / 1.5) + 1))
+        if self._status_poll_ticks % every == 0:
             kinds.add("worktree")
         # re-arm index watch if it disappeared during atomic replace
         idx = os.path.join(self.repo.git_dir, "index")
@@ -187,6 +223,7 @@ class RepoWatcher(QObject):
         self._setup_watches()
 
     def stop(self):
+        self._stopped = True
         self._poll.stop()
         self._debounce.stop()
         if self.fs.directories():

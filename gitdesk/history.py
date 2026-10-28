@@ -26,6 +26,9 @@ class HistoryPanel(QWidget):
         self._dirty = True
         self._sig = None
         self._cur_sha = None
+        self._gen = 0
+        self._pending_jump = None
+        self._compare = None
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
@@ -148,6 +151,7 @@ class HistoryPanel(QWidget):
         return [], None
 
     def reload(self):
+        """Load history on the background thread; the UI stays responsive."""
         repo = self.rw.repo
         self._dirty = False
         extra, paths = self._search_args()
@@ -159,27 +163,58 @@ class HistoryPanel(QWidget):
         q = self.search.text().strip()
         if self.cb_field.currentData() == "sha" and q:
             scope = q
-        commits = repo.log(scope=scope, limit=self.limit, extra=extra, paths=paths) if repo.head_valid() or scope == "all" else []
-        head = repo.git("rev-parse", "HEAD", check=False).strip()
-        sig = (tuple(c.sha + c.refs for c in commits[:200]), len(commits), head)
-        if sig == self._sig:
+        limit = self.limit
+        self._gen += 1
+        gen = self._gen
+
+        def job():
+            head = repo.git("rev-parse", "--verify", "-q", "HEAD", check=False).strip()
+            if scope == "current" and not head:
+                commits = []
+            else:
+                commits = repo.log(scope=scope, limit=limit, extra=extra, paths=paths,
+                                   include_head=bool(head))
+            sig = (tuple(c.sha + c.refs for c in commits[:200]), len(commits), head)
+            if sig == self._sig:
+                return None
+            branch = repo.current_branch()
+            rows = layout(commits)
+            for r in rows:
+                r.refs = parse_refs(r.commit.refs, branch)
+            return sig, rows, head
+
+        self.rw.bg.submit(job, lambda res: self._apply_reload(res, gen), key="history")
+
+    def _apply_reload(self, res, gen):
+        if gen != self._gen:
             return
-        self._sig = sig
-        rows = layout(commits)
-        branch = repo.current_branch()
-        for r in rows:
-            r.refs = parse_refs(r.commit.refs, branch)
-        keep = self._cur_sha
-        vpos = self.table.verticalScrollBar().value()
-        self.model.set_rows(rows, head)
-        self.table.verticalScrollBar().setValue(vpos)
-        if keep:
-            self.select_sha(keep, scroll=False)
-        if not rows:
-            self.info.setHtml(f"<p style='color:{theme.C['muted']}'>" +
-                              T("還沒有任何提交。", "No commits yet.") + "</p>")
-            self.files.clear()
-            self.diff.clear()
+        if res is not None:
+            sig, rows, head = res
+            self._sig = sig
+            keep = self._cur_sha
+            vpos = self.table.verticalScrollBar().value()
+            self.table.selectionModel().blockSignals(True)
+            self.model.set_rows(rows, head)
+            self.table.selectionModel().blockSignals(False)
+            self.table.verticalScrollBar().setValue(vpos)
+            if keep:
+                self.select_sha(keep, scroll=False, quiet=True)
+            if not rows:
+                self.info.setHtml(f"<p style='color:{theme.C['muted']}'>" +
+                                  T("還沒有任何提交。", "No commits yet.") + "</p>")
+                self.files.clear()
+                self.diff.clear()
+        if self._pending_jump:
+            sha, tries = self._pending_jump
+            if self.select_sha(sha):
+                self._pending_jump = None
+            elif tries < 10 and len(self.model.rows) >= self.limit:
+                self._pending_jump = (sha, tries + 1)
+                self.limit += PAGE
+                self._sig = None
+                self.reload()
+            else:
+                self._pending_jump = None
 
     def _maybe_more(self, v):
         sb = self.table.verticalScrollBar()
@@ -188,29 +223,33 @@ class HistoryPanel(QWidget):
             self._sig = None
             self.reload()
 
-    def select_sha(self, sha, scroll=True):
+    def select_sha(self, sha, scroll=True, quiet=False):
         for i, r in enumerate(self.model.rows):
             if r.commit.sha.startswith(sha):
                 idx = self.model.index(i, 0)
-                self.table.selectionModel().select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
-                self.table.setCurrentIndex(idx)
+                sm = self.table.selectionModel()
+                if quiet:
+                    sm.blockSignals(True)
+                sm.select(idx, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+                sm.setCurrentIndex(idx, QItemSelectionModel.NoUpdate)
+                if quiet:
+                    sm.blockSignals(False)
                 if scroll:
                     self.table.scrollTo(idx, QAbstractItemView.PositionAtCenter)
                 return True
         return False
 
     def jump_to(self, ref):
-        sha = self.rw.repo.git("rev-parse", ref + "^{commit}", check=False).strip()
-        if not sha:
-            return
-        if not self.select_sha(sha):
-            # not loaded yet: load more until found (bounded)
-            for _ in range(10):
+        repo = self.rw.repo
+
+        def found(sha):
+            if sha and not self.select_sha(sha):
+                self._pending_jump = (sha, 0)
                 self.limit += PAGE
                 self._sig = None
                 self.reload()
-                if self.select_sha(sha):
-                    break
+        self.rw.worker.submit(lambda: repo.git("rev-parse", ref + "^{commit}", check=False).strip(),
+                              found, key="jump")
 
     # ------------------------------------------------------------------ selection
     def selected_commits(self):
@@ -227,13 +266,29 @@ class HistoryPanel(QWidget):
         c = cs[0]
         if c.sha == self._cur_sha and self.files.count():
             return
-        self._cur_sha = c.sha
         self._compare = None
         self._show_commit(c.sha)
 
-    def _show_commit(self, sha):
+    # commits are immutable, so their details and diffs are cached for good
+    def _load_commit(self, sha):
         repo = self.rw.repo
-        d = repo.commit_details(sha)
+        return repo.commit_details(sha), repo.changed_files(sha)
+
+    def _show_commit(self, sha):
+        self._cur_sha = sha
+        cache = self.rw.diff_cache
+        hit = cache.get(("commit", sha))
+        if hit is not None:
+            self._render_commit(sha, *hit)
+            return
+
+        def done(res, sha=sha):
+            cache.put(("commit", sha), res)
+            if self._cur_sha == sha:
+                self._render_commit(sha, *res)
+        self.rw.worker.submit(lambda: self._load_commit(sha), done, key="commit")
+
+    def _render_commit(self, sha, d, files):
         if not d:
             return
         C = theme.C
@@ -263,7 +318,33 @@ class HistoryPanel(QWidget):
             f"<div style='font-size:11pt;font-weight:600;margin-bottom:6px'>{e(subject)}</div>"
             f"<table cellspacing=0 cellpadding=2>{tbl}</table>"
             + (f"<pre style='white-space:pre-wrap;font-family:inherit;margin-top:8px'>{e(body.strip())}</pre>" if body.strip() else ""))
-        self._fill_files(repo.changed_files(sha), sha, None)
+        self._fill_files(files, sha, None)
+        self._prefetch_neighbors(sha)
+
+    def _prefetch_neighbors(self, sha):
+        """Warm the cache for nearby commits so arrow-key browsing is instant."""
+        rows = self.model.rows
+        idx = next((i for i, r in enumerate(rows) if r.commit.sha == sha), None)
+        if idx is None:
+            return
+        cache = self.rw.diff_cache
+        opts = tuple(self.diff.diff_opts())
+        for j in (idx + 1, idx - 1, idx + 2, idx + 3, idx - 2):
+            if not (0 <= j < len(rows)):
+                continue
+            s2 = rows[j].commit.sha
+
+            def job(s2=s2):
+                res = cache.get(("commit", s2)) or self._load_commit(s2)
+                cache.put(("commit", s2), res)
+                files = res[1]
+                if len(files) <= 60:
+                    path = files[0][1] if len(files) == 1 else None
+                    k = ("cdiff", s2, path, None, opts)
+                    if k not in cache:
+                        cache.put(k, self.rw.repo.diff_commit(s2, path, list(opts)))
+                return None
+            self.rw.worker.submit(job, None, key=("pre-commit", s2), low=True)
 
     def _show_compare(self, a, b):
         """Two commits selected: show diff between them."""
@@ -273,7 +354,10 @@ class HistoryPanel(QWidget):
         self.info.setHtml(
             f"<div style='font-weight:600'>{T('比較兩個提交', 'Comparing two commits')}</div>"
             f"<p><code>{a.sha[:8]}</code> {e(a.subject)}<br>→ <code>{b.sha[:8]}</code> {e(b.subject)}</p>")
-        self._fill_files(self.rw.repo.changed_files(b.sha, parent=a.sha), b.sha, a.sha)
+        want = self._compare
+        self.rw.worker.submit(lambda: self.rw.repo.changed_files(b.sha, parent=a.sha),
+                              lambda files: self._compare == want and self._fill_files(files, b.sha, a.sha),
+                              key="commit")
 
     def _fill_files(self, files, sha, parent):
         self.files.blockSignals(True)
@@ -290,13 +374,29 @@ class HistoryPanel(QWidget):
             self.files.addItem(it)
         self.files.blockSignals(False)
         self.files.setCurrentRow(1 if len(files) == 1 else 0)
+        return True
 
     def _file_changed(self, it, _prev):
         if not it:
             return
         sha, path, parent = it.data(Qt.UserRole)
-        txt = self.rw.repo.diff_commit(sha, path, self.diff.diff_opts(), parent=parent)
-        self.diff.set_diff(txt, "readonly", path or sha[:10])
+        opts = tuple(self.diff.diff_opts())
+        key = ("cdiff", sha, path, parent, opts)
+        title = path or sha[:10]
+        cache = self.rw.diff_cache
+        hit = cache.get(key)
+        if hit is not None:
+            self.diff.set_diff(hit, "readonly", title)
+            return
+        self.diff.title.setText(title + "  …")
+
+        def done(txt, key=key):
+            cache.put(key, txt)
+            cur = self.files.currentItem()
+            if cur and cur.data(Qt.UserRole) == (sha, path, parent):
+                self.diff.set_diff(txt, "readonly", title)
+        self.rw.worker.submit(lambda: self.rw.repo.diff_commit(sha, path, list(opts), parent=parent),
+                              done, key="cdiff")
 
     def _anchor(self, url: QUrl):
         s = url.toString()

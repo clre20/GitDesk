@@ -33,7 +33,25 @@ class CommandLog(QObject):
 LOG = CommandLog()
 
 
+_GIT_EXE = None
+_ENV = None
+
+
+def reset_cache():
+    """Call after the git path setting changes."""
+    global _GIT_EXE, _ENV
+    _GIT_EXE = None
+    _ENV = None
+
+
 def git_executable() -> str:
+    global _GIT_EXE
+    if _GIT_EXE is None:
+        _GIT_EXE = _find_git()
+    return _GIT_EXE
+
+
+def _find_git() -> str:
     s = QSettings().value("git/path", "")
     if s and os.path.exists(s):
         return s
@@ -91,11 +109,21 @@ def _askpass_script() -> Optional[str]:
 
 
 def base_env() -> dict:
+    global _ENV
+    if _ENV is None:
+        _ENV = _build_env()
+    return dict(_ENV)
+
+
+def _build_env() -> dict:
     env = os.environ.copy()
     env["GIT_EDITOR"] = "true"          # never block waiting for an editor
     env["GIT_MERGE_AUTOEDIT"] = "no"
     env["GIT_PAGER"] = "cat"
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # Read-only commands (status, diff…) must not rewrite .git/index: that would wake
+    # our own file watcher and cause an endless refresh loop, and it fights other tools.
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     ap = _askpass_script()
     if ap and not env.get("GIT_ASKPASS"):
         env["GIT_ASKPASS"] = ap
@@ -514,14 +542,14 @@ class Repo:
     LOG_FMT = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e"
 
     def log(self, scope: str = "all", limit: int = 3000, skip: int = 0, extra=None,
-            paths=None) -> List[Commit]:
+            paths=None, include_head: bool = True) -> List[Commit]:
         args = ["log", "--topo-order", "--decorate=full", f"--format={self.LOG_FMT}", f"-n{limit}"]
         if skip:
             args.append(f"--skip={skip}")
         if extra:
             args += extra
         if scope == "all":
-            args += ["--branches", "--remotes", "--tags", "HEAD"]
+            args += ["--branches", "--remotes", "--tags"] + (["HEAD"] if include_head else [])
         elif scope == "current":
             args.append("HEAD")
         elif scope:

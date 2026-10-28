@@ -19,6 +19,7 @@ from .history import HistoryPanel
 from .i18n import T
 from .sidebar import Sidebar
 from .watcher import RepoWatcher
+from .worker import LRU, Worker
 
 
 class Banner(QFrame):
@@ -38,6 +39,10 @@ class Banner(QFrame):
         h.addLayout(self.box)
 
     def set(self, text, buttons):
+        sig = (text, tuple(b[0] for b in buttons))
+        if sig == getattr(self, "_sig", None) and self.isVisible():
+            return
+        self._sig = sig
         self.label.setText(text)
         for b in self.btns:
             b.deleteLater()
@@ -92,13 +97,22 @@ class RepoWidget(QWidget):
         self.sidebar.selected.connect(self._side_select)
         self.sidebar.contextRequested.connect(self._side_menu)
 
-        self.watcher = RepoWatcher(self.repo, self)
+        self.worker = Worker(self)      # interactive reads (diffs, commit details)
+        self.bg = Worker(self)          # refresh / status / history loading
+        self.diff_cache = LRU(400)
+        self._refresh_pending = set()
+        self._refresh_inflight = False
+        self.status_duration = 0.05
+        self._first = True
+
+        self.watcher = RepoWatcher(self.repo, self, worker=self.bg)
         self.watcher.changed.connect(self.refresh)
 
-        self.refresh({"refs", "index", "state", "worktree", "config"})
+        # first load is synchronous so the window opens fully populated
+        self._apply_refresh(self._load({"refs", "index", "state", "worktree", "config"}))
         st = self.changes.status
         has_changes = st and (st.unstaged or st.staged or st.conflicts)
-        self.show_view("changes" if has_changes or not self.repo.head_valid() else "history")
+        self.show_view("changes" if has_changes or not st.oid or st.oid == "(initial)" else "history")
 
     # ------------------------------------------------------------------ views
     def show_view(self, which):
@@ -108,36 +122,66 @@ class RepoWidget(QWidget):
     def title(self):
         return self.repo.name
 
+    def current_branch(self):
+        st = self.changes.status
+        if st and st.head and st.head != "(detached)":
+            return st.head
+        return ""
+
     # ------------------------------------------------------------------ refresh
     def refresh(self, kinds=None):
-        kinds = set(kinds or {"refs", "index", "state", "worktree"})
+        """Request a refresh; the git reads run on a background thread."""
+        self._refresh_pending |= set(kinds or {"refs", "index", "state", "worktree"})
+        if not self._refresh_inflight:
+            self._start_refresh()
+
+    def _start_refresh(self):
+        kinds, self._refresh_pending = self._refresh_pending, set()
+        if not kinds:
+            return
+        self._refresh_inflight = True
+        self.bg.submit(lambda: self._load(kinds), self._apply_refresh, key="refresh")
+
+    def _load(self, kinds):
+        """Runs on the worker thread: collect everything the UI needs."""
+        import time
         repo = self.repo
         if not os.path.isdir(repo.git_dir):
-            return
-        try:
-            st = repo.status()
-        except GitError as e:
-            LOG.entry.emit("err", str(e))
-            return
-        if st.raw != self._last_status_raw:
-            self._last_status_raw = st.raw
-            self.changes.set_status(st)
-            self.sidebar.set_changes_count(len(st.unstaged) + len(st.staged) + len(st.conflicts))
-            kinds.add("status")
+            return None
+        t0 = time.monotonic()
+        st = repo.status()
+        self.status_duration = time.monotonic() - t0
+        refs = None
         if kinds & {"refs", "state", "config"}:
-            self.sidebar.populate(repo.branches(), repo.remote_branches(), repo.remotes(),
-                                  repo.tags(), repo.stashes(), repo.submodules(), repo.worktrees(),
-                                  repo.path)
-            self.history.mark_dirty()
-        elif "status" in kinds and st.head:
-            pass
-        if kinds & {"refs", "state", "status"}:
-            self._update_banner(st)
-            self.titleChanged.emit()
-        if "config" in kinds or "state" in kinds:
-            self.watcher.rescan()
-        if self.main:
-            self.main.update_status_bar(self)
+            refs = (repo.branches(), repo.remote_branches(), repo.remotes(), repo.tags(),
+                    repo.stashes(), repo.submodules(), repo.worktrees())
+        return kinds, st, refs
+
+    def _apply_refresh(self, res):
+        self._refresh_inflight = False
+        if res:
+            kinds, st, refs = res
+            kinds = set(kinds)
+            if st.raw != self._last_status_raw:
+                self._last_status_raw = st.raw
+                self.changes.set_status(st)
+                self.sidebar.set_changes_count(len(st.unstaged) + len(st.staged) + len(st.conflicts))
+                kinds.add("status")
+            elif kinds & {"worktree", "index"}:
+                self.changes.status_touched()
+            if refs is not None:
+                self.sidebar.populate(*refs, self.repo.path)
+                self.history.mark_dirty()
+            if kinds & {"refs", "state", "status"} or self._first:
+                self._update_banner(st)
+                self.titleChanged.emit()
+            if not self._first and ("config" in kinds or "state" in kinds):
+                self.watcher.rescan()
+            self._first = False
+            if self.main:
+                self.main.update_status_bar(self)
+        if self._refresh_pending:
+            self._start_refresh()
 
     def refresh_all(self):
         self._last_status_raw = None
@@ -231,11 +275,8 @@ class RepoWidget(QWidget):
     def _report_failure(self, args, text):
         if self.repo.operation_state() in ("merge", "rebase", "cherry-pick", "revert", "am") and \
                 ("CONFLICT" in text or "conflict" in text.lower()):
-            QMessageBox.warning(self, T("發生衝突", "Conflicts"),
-                                T("操作因衝突而暫停。請在「工作區變更」中解決衝突，然後按上方橫幅的「繼續」。",
-                                  "The operation stopped because of conflicts. Resolve them in Local Changes, "
-                                  "then press Continue in the banner above.") + "\n\n" + text[-1500:])
             self.show_view("changes")
+            self.error(T("發生衝突", "Conflicts"), text[-3000:])
             return
         self.error("git " + " ".join(args[:3]), text or T("命令失敗", "Command failed"))
 
@@ -271,14 +312,8 @@ class RepoWidget(QWidget):
         return box.clickedButton() is yes
 
     def error(self, title, text):
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Critical)
-        box.setWindowTitle(title)
-        lines = text.strip().splitlines()
-        box.setText("\n".join(lines[:12]) + ("\n…" if len(lines) > 12 else ""))
-        if len(lines) > 12:
-            box.setDetailedText(text)
-        box.exec()
+        from .errors import show_git_error
+        show_git_error(self, title, text)
 
     def show_text(self, title, text):
         d = QDialog(self)
@@ -345,5 +380,7 @@ class RepoWidget(QWidget):
     # ------------------------------------------------------------------ cleanup
     def close_repo(self):
         self.watcher.stop()
+        self.worker.stop()
+        self.bg.stop()
         for t in self._tasks:
             t.kill()
