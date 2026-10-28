@@ -33,8 +33,20 @@ def main():
     QCoreApplication.setApplicationVersion(__version__)
     if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
         QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    from PySide6.QtCore import QSettings, qInstallMessageHandler, QtMsgType
+    from . import logger
+    logger.setup(verbose=QSettings().value("debug/verbose", "false") == "true")
+
+    def qt_messages(mode, ctx, msg):
+        if mode in (QtMsgType.QtWarningMsg, QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+            if "propagateSizeHints" not in msg:
+                logger.log.warning(f"Qt: {msg}")
+    qInstallMessageHandler(qt_messages)
+
     app = QApplication(sys.argv)
     app.setDesktopFileName(APP_ID)
+    logger.log_startup()
+    watchdog = logger.StallWatchdog(threshold=3.0)  # noqa: F841  (kept alive for the session)
 
     from . import icons, theme
     theme.apply_theme(app)
@@ -65,7 +77,9 @@ def main():
     w = MainWindow()
     w.show()
     w.open_repo(path)
-    return app.exec()
+    code = app.exec()
+    logger.log.info(f"exit (code {code})")
+    return code
 
 
 if __name__ == "__main__":

@@ -122,6 +122,11 @@ class Updater(QObject):
         threading.Thread(target=run, daemon=True).start()
 
     def _on_checked(self, info, err):
+        from . import logger
+        if err:
+            logger.log.warning(f"update check failed: {err}")
+        elif info:
+            logger.log.info(f"update check: current {__version__}, latest {info.get('tag')} ({self.kind})")
         if err or not info or not info.get("tag"):
             if self._manual:
                 QMessageBox.warning(self.win, T("檢查更新", "Check for updates"),
@@ -241,6 +246,8 @@ class Updater(QObject):
         threading.Thread(target=run, daemon=True).start()
 
     def _downloaded(self, path, err, asset):
+        from . import logger
+        logger.log.info(f"update download {asset['name']}: {'ok ' + path if not err else 'failed: ' + str(err)}")
         if self._progress:
             self._progress.reset()
             self._progress = None
@@ -255,6 +262,8 @@ class Updater(QObject):
 
     # ------------------------------------------------------------------ install
     def _install_windows(self, setup):
+        from . import logger
+        logger.log.info(f"starting installer {setup}")
         app_dir = os.path.dirname(os.path.abspath(sys.executable))
         local = os.environ.get("LOCALAPPDATA", "")
         scope = "/CURRENTUSER" if local and app_dir.lower().startswith(local.lower()) else "/ALLUSERS"
@@ -282,6 +291,8 @@ class Updater(QObject):
         self.win.close()
 
     def _install_deb(self, deb):
+        from . import logger
+        logger.log.info(f"installing {deb}")
         pk = shutil.which("pkexec")
         if not pk:
             QMessageBox.information(self.win, T("更新", "Update"), T(

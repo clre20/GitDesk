@@ -97,6 +97,8 @@ class Worker(QObject):
         if not self._alive:
             return
         if err:
+            from . import logger
+            logger.log.warning("background task failed: " + err.strip())
             LOG.entry.emit("err", err.strip())
             return
         if cb:
@@ -105,7 +107,10 @@ class Worker(QObject):
             except RuntimeError:
                 pass          # widget closed meanwhile
             except Exception:
-                LOG.entry.emit("err", traceback.format_exc(limit=6))
+                from . import logger
+                tb = traceback.format_exc(limit=8)
+                logger.log.error("UI callback failed:\n" + tb)
+                LOG.entry.emit("err", tb)
 
     def stop(self):
         self._alive = False

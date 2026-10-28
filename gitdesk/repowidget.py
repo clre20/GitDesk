@@ -227,6 +227,10 @@ class RepoWidget(QWidget):
         t0 = time.monotonic()
         st = repo.status()
         self.status_duration = time.monotonic() - t0
+        if self.status_duration > 3:
+            from . import logger
+            logger.log.warning(f"git status took {self.status_duration:.1f} s "
+                               f"({len(st.unstaged)} unstaged, {len(st.staged)} staged) in {repo.path}")
         refs = None
         if kinds & {"refs", "state", "config"}:
             refs = (repo.branches(), repo.remote_branches(), repo.remotes(), repo.tags(),
@@ -400,6 +404,8 @@ class RepoWidget(QWidget):
     def cancel_operations(self):
         """Stop the running git command and drop everything still queued."""
         self._cancelled = True
+        from . import logger
+        logger.log.info(f"user cancelled operation ({len(self._queue)} queued step(s) dropped)")
         self._queue.clear()
         for t in list(self._tasks):
             t.kill()
@@ -457,6 +463,8 @@ class RepoWidget(QWidget):
         return box.clickedButton() is yes
 
     def error(self, title, text):
+        from . import logger
+        logger.log.warning(f"error shown to user [{title}]: {text.strip()[-1500:]}")
         from .errors import show_git_error
         show_git_error(self, title, text)
 

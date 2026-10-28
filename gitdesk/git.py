@@ -164,8 +164,22 @@ def run_git(args: List[str], cwd: Optional[str] = None, input: Optional[str] = N
     e = base_env()
     if env:
         e.update(env)
-    p = subprocess.run(full, cwd=cwd, input=input.encode("utf-8") if input is not None else None,
-                       capture_output=True, env=e, creationflags=NO_WINDOW)
+    import time as _time
+    from . import logger as _lg
+    t0 = _time.monotonic()
+    try:
+        p = subprocess.run(full, cwd=cwd, input=input.encode("utf-8") if input is not None else None,
+                           capture_output=True, env=e, creationflags=NO_WINDOW)
+    except OSError as ex:
+        _lg.log.error(f"cannot run git ({git_executable()}): {ex}")
+        raise GitError(args, -1, "", f"Failed to start git: {ex}")
+    dt = _time.monotonic() - t0
+    if log or (check and p.returncode != 0):
+        # user-visible commands and real failures at INFO/WARNING level
+        _lg.git_command(fmt_cmd(list(args)), p.returncode, dt,
+                        p.stderr.decode("utf-8", "replace"), "" if binary else p.stdout.decode("utf-8", "replace"))
+    elif _lg.log.isEnabledFor(10):   # background queries only in verbose mode
+        _lg.log.debug(f"query ({dt * 1000:.0f} ms, exit {p.returncode}): {fmt_cmd(list(args))}")
     if binary:
         out = p.stdout
     else:
@@ -211,6 +225,8 @@ class GitTask(QObject):
         self.proc.errorOccurred.connect(self._error)
 
     def start(self):
+        import time as _time
+        self._t0 = _time.monotonic()
         if self.program:
             LOG.entry.emit("cmd", " ".join(shlex.quote(a) for a in [self.program] + self.args))
             self.proc.start(self.program, self.args)
@@ -234,6 +250,8 @@ class GitTask(QObject):
     def _error(self, err):
         if err == QProcess.FailedToStart:
             msg = "Failed to start git. Is git installed?"
+            from . import logger as _lg
+            _lg.log.error(f"{msg} ({self.program or git_executable()})")
             self._err.append(msg)
             LOG.entry.emit("err", msg)
             self.done.emit(-1, "", msg)
@@ -241,6 +259,10 @@ class GitTask(QObject):
     def _finished(self, code, _status):
         out = "".join(self._out)
         err = "".join(self._err)
+        import time as _time
+        from . import logger as _lg
+        cmd = fmt_cmd(self.args, prefix=self.program or "git")
+        _lg.git_command(cmd, code, _time.monotonic() - getattr(self, "_t0", _time.monotonic()), err, out)
         text = (out + err).rstrip()
         if len(text) > 20000:
             text = text[:20000] + "\n…"

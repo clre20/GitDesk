@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from PySide6.QtCore import QEvent, QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
@@ -48,6 +49,8 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.BottomDockWidgetArea, self.dock)
         self.resizeDocks([self.dock], [140], Qt.Vertical)
 
+        from . import logger
+        logger.set_error_ui(self._show_crash)
         from .updater import Updater
         self.updater = Updater(self)
         self.updater.stateChanged.connect(self._update_state)
@@ -263,6 +266,10 @@ class MainWindow(QMainWindow):
                       "refresh", repo=False))
         m.addAction(A(T("開啟發布頁面", "Open releases page"), self._open_releases, "globe", repo=False))
         m.addSeparator()
+        m.addAction(A(T("開啟記錄檔資料夾", "Open log folder"), self.open_log_folder, "folder", repo=False))
+        m.addAction(A(T("匯出診斷資訊（回報問題用）…", "Export diagnostics (for bug reports)…"),
+                      self.export_diagnostics, "bug", repo=False))
+        m.addSeparator()
         m.addAction(A(T("關於", "About"), self.about, "info", repo=False))
 
     def _build_status(self):
@@ -303,6 +310,63 @@ class MainWindow(QMainWindow):
         if rw:
             self._update_tab(rw)
 
+    def open_log_folder(self):
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        from . import logger
+        QDesktopServices.openUrl(QUrl.fromLocalFile(logger.log_dir()))
+
+    def export_diagnostics(self):
+        from PySide6.QtWidgets import QFileDialog
+        from . import logger
+        name = time.strftime("GitDesk-diagnostics-%Y%m%d-%H%M%S.zip")
+        dest, _ = QFileDialog.getSaveFileName(self, T("匯出診斷資訊", "Export diagnostics"),
+                                              os.path.join(os.path.expanduser("~"), "Desktop", name)
+                                              if os.path.isdir(os.path.join(os.path.expanduser("~"), "Desktop"))
+                                              else os.path.join(os.path.expanduser("~"), name), "Zip (*.zip)")
+        if not dest:
+            return
+        rw = self.current_repo()
+        extra = ""
+        if rw:
+            st = rw.changes.status
+            extra = (f"repository: {rw.repo.path}\nbranch: {st.head if st else '?'}\n"
+                     f"changes: {len(st.unstaged) if st else 0} unstaged, {len(st.staged) if st else 0} staged\n"
+                     f"last status time: {rw.status_duration:.2f} s\noperation: {rw.repo.operation_state() or '-'}")
+        try:
+            logger.export_diagnostics(dest, extra)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, str(e))
+            return
+        QMessageBox.information(self, APP_NAME, T(
+            f"已匯出：\n{dest}\n\n回報問題時請附上這個檔案。內容包含程式與系統版本、執行過的 git 指令與錯誤訊息，"
+            f"不含密碼或檔案內容。",
+            f"Saved:\n{dest}\n\nAttach this file when reporting a problem. It contains app/system versions, the git "
+            f"commands that ran and their errors — no passwords or file contents."))
+
+    def _show_crash(self, summary):
+        """Uncaught exception: tell the user once (throttled) and point to the log."""
+        now = time.time()
+        if now - getattr(self, "_last_crash_box", 0) < 10:
+            return
+        self._last_crash_box = now
+
+        def show():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle(APP_NAME)
+            box.setText(T("發生未預期的錯誤，詳細內容已寫入記錄檔。", "An unexpected error occurred; details were written to the log."))
+            box.setInformativeText(summary[:500])
+            open_btn = box.addButton(T("開啟記錄檔資料夾", "Open log folder"), QMessageBox.ActionRole)
+            exp_btn = box.addButton(T("匯出診斷資訊…", "Export diagnostics…"), QMessageBox.ActionRole)
+            box.addButton(T("關閉", "Close"), QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is open_btn:
+                self.open_log_folder()
+            elif box.clickedButton() is exp_btn:
+                self.export_diagnostics()
+        QTimer.singleShot(0, show)
+
     def _open_releases(self):
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtCore import QUrl
@@ -334,6 +398,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, str(e))
             return
         add_recent(top)
+        from . import logger
+        logger.log.info(f"opened repository {top}")
         rw.titleChanged.connect(lambda rw=rw: self._update_tab(rw))
         rw.busyChanged.connect(self._busy)
         i = self.tabs.addTab(rw, icons.icon("repo"), rw.title())
@@ -506,6 +572,8 @@ class MainWindow(QMainWindow):
         email = run_git(["config", "--global", "--get", "user.email"], check=False).strip()
         f.check("autoupdate", T("啟動時自動檢查更新", "Check for updates at startup"),
                 s.value("update/auto", "true") != "false")
+        f.check("verbose", T("詳細記錄（除錯用，記錄檔會比較大）", "Verbose logging (for debugging; larger log files)"),
+                s.value("debug/verbose", "false") == "true")
         f.text("name", T("全域 user.name", "Global user.name"), name)
         f.text("email", T("全域 user.email", "Global user.email"), email)
         try:
@@ -527,6 +595,9 @@ class MainWindow(QMainWindow):
         s.setValue("git/pull_mode", v["pull"])
         s.setValue("git/default_branch", v["branch"] or "main")
         s.setValue("update/auto", "true" if v["autoupdate"] else "false")
+        s.setValue("debug/verbose", "true" if v["verbose"] else "false")
+        from . import logger
+        logger.set_verbose(v["verbose"])
         try:
             if v["name"] and v["name"] != name:
                 run_git(["config", "--global", "user.name", v["name"]], log=True)
