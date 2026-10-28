@@ -258,8 +258,10 @@ class Updater(QObject):
         app_dir = os.path.dirname(os.path.abspath(sys.executable))
         local = os.environ.get("LOCALAPPDATA", "")
         scope = "/CURRENTUSER" if local and app_dir.lower().startswith(local.lower()) else "/ALLUSERS"
+        from .i18n import current_language
+        lang = "chinesetraditional" if current_language() == "zh_TW" else "english"
         args = [setup, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", scope,
-                f'/DIR={app_dir}']
+                f"/LANG={lang}", f'/DIR={app_dir}']
         try:
             try:
                 DETACHED = 0x00000008

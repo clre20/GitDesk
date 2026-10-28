@@ -222,6 +222,45 @@ class CloneDialog(QDialog):
         self.reject()
 
 
+class LanguageDialog(QDialog):
+    """First launch only: pick the interface language before anything else."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(icons.app_icon())
+        self.setMinimumWidth(420)
+        self.lang = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(28, 24, 28, 24)
+        v.setSpacing(14)
+        logo = QLabel()
+        logo.setPixmap(icons.app_icon().pixmap(56, 56))
+        logo.setAlignment(Qt.AlignCenter)
+        v.addWidget(logo)
+        h = QLabel("請選擇介面語言\nChoose your language")
+        h.setAlignment(Qt.AlignCenter)
+        h.setProperty("h2", True)
+        v.addWidget(h)
+        for code, text in (("zh_TW", "繁體中文"), ("en", "English")):
+            b = QPushButton(text)
+            b.setMinimumHeight(44)
+            b.clicked.connect(lambda _=False, c=code: self._pick(c))
+            v.addWidget(b)
+        note = QLabel("之後可在「設定」中更改 · You can change this later in Settings")
+        note.setProperty("muted", True)
+        note.setAlignment(Qt.AlignCenter)
+        note.setWordWrap(True)
+        v.addWidget(note)
+
+    def _pick(self, code):
+        from . import i18n
+        set_language(code)
+        i18n._lang = code
+        self.lang = code
+        self.accept()
+
+
 class StartupDialog(QDialog):
     """Shown at launch: the user must pick the working folder for this session."""
     _warned = False
