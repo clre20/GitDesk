@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=GitDesk
+GenericName=Git Client
+GenericName[zh_TW]=Git 圖形化用戶端
+Comment=Graphical Git client
+Comment[zh_TW]=圖形化 Git 用戶端
+Exec=gitdesk %F
+Icon=gitdesk
+Terminal=false
+Categories=Development;RevisionControl;
+Keywords=git;version;control;scm;
+StartupWMClass=gitdesk
+MimeType=inode/directory;
